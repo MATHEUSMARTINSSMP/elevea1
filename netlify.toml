@@ -1,0 +1,31 @@
+# netlify.toml
+
+# === Build / Functions ===
+[build]
+  functions = "netlify/functions"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# === Redirects / Functions HTTP ===
+
+# Webhook do Mercado Pago
+[[redirects]]
+  from = "/api/mp-webhook"
+  to   = "/.netlify/functions/mp-webhook"
+  status = 200
+
+# SPA fallback (último)
+[[redirects]]
+  from = "/*"
+  to   = "/index.html"
+  status = 200
+
+# (Opcional) Ative a proteção das rotas privadas:
+# [[edge_functions]]
+#   function = "protect"
+#   path = "/admin/*"
+# [[edge_functions]]
+#   function = "protect"
+#   path = "/client/*"
