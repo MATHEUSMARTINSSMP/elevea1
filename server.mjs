@@ -1,116 +1,162 @@
+/**
+ * ELEVEA Backend Server - Vite Integration
+ * 
+ * This server integrates the complete ELEVEA backend system with Vite for development.
+ * It serves both the frontend (via Vite) and all ELEVEA API endpoints.
+ * 
+ * Features:
+ * - SQLite database with all tables
+ * - JWT authentication system
+ * - All API routes for sites, settings, assets, leads, feedbacks, traffic
+ * - VIP PIN validation system
+ * - Subscription management
+ * - File upload handling
+ * - Automatic database seeding
+ * - Vite dev server integration
+ */
+
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promises as fs } from 'fs';
-import multer from 'multer';
-import Database from 'better-sqlite3';
-import { drizzle } from 'drizzle-orm/better-sqlite3';
-import { eq, desc, count, sql, and } from 'drizzle-orm';
-import crypto from 'crypto';
+
+// Import ELEVEA database and services
+import { initDatabase, closeDatabase } from './src/db/database.js';
+import { SubscriptionService } from './src/services/subscriptionService.js';
+
+// Import all ELEVEA routes
+import authRoutes from './src/routes/auth.js';
+import subscriptionRoutes from './src/routes/subscription.js';
+import settingsRoutes from './src/routes/settings.js';
+import assetsRoutes from './src/routes/assets.js';
+import leadsRoutes from './src/routes/leads.js';
+import feedbacksRoutes from './src/routes/feedbacks.js';
+import trafficRoutes from './src/routes/traffic.js';
+import sitesRoutes from './src/routes/sites.js';
+
+// Import utilities
+import { seedDatabase } from './src/utils/seed.js';
 
 // ES modules compatibility
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Configurações
-const PORT = parseInt(process.env.PORT || '8080', 10);
-const isDev = process.env.NODE_ENV !== 'production';
+// Configuration - Use Vite's expected port (8080) with fallback
+const PORT = parseInt(process.env.PORT || process.env.VITE_PORT || '8080', 10);
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const isDev = NODE_ENV !== 'production';
 
-console.log('🚀 Iniciando servidor Elevea nativo...');
+console.log('🚀 Starting ELEVEA Backend Server with Vite Integration...');
+console.log(`🌟 ELEVEA Digital Agency Platform`);
+console.log(`📊 Environment: ${NODE_ENV}`);
+console.log(`🔌 Port: ${PORT}`);
+console.log(`📋 Features: Sites, Settings, Assets, Leads, Feedbacks, Traffic, Auth`);
+console.log(`🔐 Authentication: JWT with Role-based access control`);
+console.log(`💎 Plans: Essential & VIP with PIN validation`);
 
-// Schema simplificado inline para evitar problemas de import
-const sitesTable = 'sites';
-const leadsTable = 'leads';
-const feedbacksTable = 'feedbacks';
-const trafficHitsTable = 'traffic_hits';
-const assetsTable = 'assets';
-
-// Inicializar banco
-async function initDatabase() {
-  const dbPath = path.join(__dirname, 'data', 'elevea.db');
-  const dataDir = path.dirname(dbPath);
-  
+async function createEleveaApp() {
   try {
-    await fs.access(dataDir);
-  } catch {
-    await fs.mkdir(dataDir, { recursive: true });
+    // Initialize ELEVEA database
+    console.log('🔧 Initializing ELEVEA database...');
+    await initDatabase();
+    console.log('✅ ELEVEA database initialized');
+    
+    // Seed database with default data
+    console.log('🌱 Seeding database...');
+    await seedDatabase();
+    
+    // Create Express app
+    const app = express();
+    
+    // Trust proxy (for proper IP detection)
+    app.set('trust proxy', true);
+    
+    // Middleware
+    app.use(cors({
+      origin: true, // Allow all origins in development
+      credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+    }));
+    
+    app.use(express.json({ limit: '10mb' }));
+    app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+    
+    // Security headers
+    app.use((req, res, next) => {
+      res.set({
+        'X-Content-Type-Options': 'nosniff',
+        'X-Frame-Options': 'SAMEORIGIN',
+        'X-XSS-Protection': '1; mode=block'
+      });
+      next();
+    });
+    
+    // Request logging in development
+    if (isDev) {
+      app.use((req, res, next) => {
+        if (req.path.startsWith('/api/')) {
+          console.log(`📡 API ${req.method} ${req.path}`, {
+            query: req.query,
+            body: req.method !== 'GET' ? req.body : undefined
+          });
+        }
+        next();
+      });
+    }
+    
+    // Ensure uploads directory exists
+    const uploadsDir = path.join(process.cwd(), 'uploads');
+    try {
+      await fs.access(uploadsDir);
+    } catch {
+      await fs.mkdir(uploadsDir, { recursive: true });
+      console.log('📁 Created uploads directory');
+    }
+    
+    // Serve uploaded files
+    app.use('/uploads', express.static(uploadsDir));
+    
+    // ELEVEA API Health check
+    app.get('/health', (req, res) => {
+      res.json({
+        ok: true,
+        service: 'ELEVEA Backend',
+        version: '1.0.0',
+        timestamp: new Date().toISOString(),
+        environment: NODE_ENV,
+        features: [
+          'Authentication (JWT)',
+          'Sites Management',
+          'Settings with VIP PIN',
+          'Assets Upload',
+          'Leads Collection',
+          'Feedbacks with Approval',
+          'Traffic Analytics',
+          'Subscription Management'
+        ]
+      });
+    });
+    
+    // ELEVEA API Routes with /api prefix
+    app.use('/api/auth', authRoutes);
+    app.use('/api/subscription', subscriptionRoutes);
+    app.use('/api/settings', settingsRoutes);
+    app.use('/api/assets', assetsRoutes);
+    app.use('/api/leads', leadsRoutes);
+    app.use('/api/feedbacks', feedbacksRoutes);
+    app.use('/api/traffic', trafficRoutes);
+    app.use('/api', sitesRoutes); // Sites routes are at root level
+    
+    console.log('✅ ELEVEA API routes configured');
+    
+    return app;
+  } catch (error) {
+    console.error('❌ Failed to create ELEVEA app:', error);
+    throw error;
   }
-  
-  const sqlite = new Database(dbPath);
-  sqlite.pragma('journal_mode = WAL');
-  
-  // Criar tabelas
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS sites (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      site_slug TEXT NOT NULL UNIQUE,
-      email TEXT NOT NULL,
-      full_name TEXT,
-      company TEXT,
-      phone TEXT,
-      document TEXT,
-      plan TEXT NOT NULL DEFAULT 'essential',
-      status TEXT NOT NULL DEFAULT 'active',
-      settings TEXT DEFAULT '{}',
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS leads (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      site_slug TEXT NOT NULL,
-      name TEXT NOT NULL,
-      email TEXT NOT NULL,
-      phone TEXT,
-      message TEXT,
-      source TEXT DEFAULT 'website',
-      metadata TEXT DEFAULT '{}',
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS feedbacks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      site_slug TEXT NOT NULL,
-      name TEXT,
-      email TEXT,
-      rating INTEGER NOT NULL,
-      comment TEXT NOT NULL,
-      approved INTEGER DEFAULT 0,
-      is_public INTEGER DEFAULT 0,
-      created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS traffic_hits (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      site_slug TEXT NOT NULL,
-      path TEXT DEFAULT '/',
-      user_agent TEXT,
-      ip TEXT,
-      referrer TEXT,
-      metadata TEXT DEFAULT '{}',
-      timestamp INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS assets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      site_slug TEXT NOT NULL,
-      filename TEXT NOT NULL,
-      original_name TEXT NOT NULL,
-      mimetype TEXT NOT NULL,
-      size INTEGER NOT NULL,
-      path TEXT NOT NULL,
-      category TEXT DEFAULT 'general',
-      is_public INTEGER DEFAULT 1,
-      uploaded_at INTEGER NOT NULL
-    );
-  `);
-  
-  const db = drizzle(sqlite);
-  console.log('✅ Banco de dados inicializado');
-  
-  return { db, sqlite };
 }
 
 // Storage helper functions
