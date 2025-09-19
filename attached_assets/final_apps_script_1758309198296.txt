@@ -1,0 +1,3414 @@
+const BUILD = 'debug-2025-09-11';
+
+/** === Spreadsheet opener (sempre a planilha certa) === */
+function openSS_() {
+  // 1) tenta pelas Script Properties
+  var props = PropertiesService.getScriptProperties();
+  var ID = String(props.getProperty('SPREADSHEET_ID') || '').trim();
+  // 2) fallback hard-coded (mantenha seu ID aqui também)
+  if (!ID) ID = '19T5YUVviV8F9GZwwwQM_Dsyz9WbPq97JeHSDHOJG8';
+  try {
+    return SpreadsheetApp.openById(ID);
+  } catch (e) {
+    throw new Error('SPREADSHEET_ID inválido ou sem acesso: ' + ID + ' → ' + e);
+  }
+}
+
+/** ===================== GET HANDLER (validate + ping + admin + sites + status + settings/leads/feedbacks/traffic/assets) ===================== */
+function doGet(e) {
+  const ss = openSS_();
+  const p = (e && e.parameter) ? e.parameter : {};
+  const type = String(p.type || "").toLowerCase();
+
+  // CORS preflight support
+  if (type === "options" || type === "cors") {
+    return jsonOut_({ ok: true, message: "CORS preflight" });
+  }
+
+  // log de entrada
+  try {
+    ensureLogSheet_(ss).appendRow([
+      new Date(), "get_entry", "", "", "", "",
+      type || "", "", Object.keys(p || {}).join(","), "", ""
+    ]);
+  } catch (_) {}
+
+  /* -------- ping -------- */
+  if (type === "ping") {
+    return jsonOut_({ ok: true, note: "webapp alive (GET)", build: BUILD });
+  }
+
+  /* -------- validate (cadastro) -------- */
+  if (type === "validate") {
+    const slugRaw = String(p.siteSlug || "");
+    const cpfRaw  = String(p.cpf || "");
+    const slug = normalizeSlug_(slugRaw);
+    const cpf  = onlyDigits_(cpfRaw);
+
+    const errors = [];
+    if (!slug) errors.push("siteSlug_obrigatorio");
+    if (slug && (slug.length < 3 || slug.length > 30)) errors.push("siteSlug_tamanho_invalido");
+    if (slug && !/^[A-Z0-9-]+$/.test(slug)) errors.push("siteSlug_caracteres_invalidos");
+    if (slug && slugExiste_(slug)) errors.push("siteSlug_ja_usado");
+    if (cpf && !isValidCPF_(cpf)) errors.push("cpf_invalido");
+
+    try {
+      ensureLogSheet_(ss).appendRow([
+        new Date(), "get_validate_done", "", "", "", "",
+        "validate", "", "", errors.length ? "" : "ok", errors.join("|")
+      ]);
+    } catch (_) {}
+
+    return jsonOut_({ ok: errors.length === 0, errors });
+  }
+
+  /* -------- admin_set (manual_block) via GET com token -------- */
+  if (type === "admin_set") {
+    var props = PropertiesService.getScriptProperties();
+    var ADMIN = props.getProperty("ADMIN_DASH_TOKEN") || props.getProperty("ADMIN_TOKEN") || "";
+    var token = String(p.token || "");
+    if (!ADMIN || token !== ADMIN) {
+      try { ensureLogSheet_(ss).appendRow([new Date(),"get_admin_set_fail","","","","","admin_set","","","unauthorized",""]); } catch(_){}
+      return jsonOut_({ ok: false, error: "unauthorized" });
+    }
+
+    var site = normalizeSlug_(String(p.site || p.siteSlug || ""));
+    var manual = String(p.manualBlock || p.block || "").toLowerCase();
+    var manualBlock = (manual === "1" || manual === "true" || manual === "yes" || manual === "on");
+    if (!site) return jsonOut_({ ok: false, error: "missing_site" });
+
+    var shCad = ss.getSheetByName("cadastros");
+    if (!shCad) return jsonOut_({ ok: false, error: "missing_sheet_cadastros" });
+
+    // headers (trim)
+    var headers = shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+    var idxSite   = headers.indexOf("siteSlug");       if (idxSite === -1) return jsonOut_({ ok:false, error:"missing_siteSlug_header" });
+    var idxManual = headers.indexOf("manual_block");   // pode não existir
+    var idxUpd    = headers.indexOf("updated_at");     // pode não existir
+
+    if (idxManual === -1) {
+      var lastCol = shCad.getLastColumn();
+      shCad.insertColumnAfter(lastCol);
+      shCad.getRange(1, lastCol + 1).setValue("manual_block");
+      headers   = shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+      idxManual = headers.indexOf("manual_block");
+    }
+    if (idxUpd === -1) {
+      var lastCol2 = shCad.getLastColumn();
+      shCad.insertColumnAfter(lastCol2);
+      shCad.getRange(1, lastCol2 + 1).setValue("updated_at");
+      headers = shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+      idxUpd  = headers.indexOf("updated_at");
+    }
+
+    var last = shCad.getLastRow(); if (last < 2) return jsonOut_({ ok:false, error:"no_rows" });
+    var rows = shCad.getRange(2, 1, last-1, shCad.getLastColumn()).getValues();
+
+    var updated = false;
+    for (var j = 0; j < rows.length; j++) {
+      var s = normalizeSlug_(String(rows[j][idxSite] || ""));
+      if (s === site) {
+        rows[j][idxManual] = manualBlock ? "TRUE" : "";
+        if (idxUpd !== -1) rows[j][idxUpd] = new Date().toISOString();
+        updated = true;
+        break;
+      }
+    }
+    if (!updated) return jsonOut_({ ok:false, error:"site_not_found" });
+
+    shCad.getRange(2, 1, last-1, shCad.getLastColumn()).setValues(rows);
+    try { ensureLogSheet_(ss).appendRow([new Date(),"get_admin_set_ok","","","","","admin_set","","","ok",""]); } catch(_){}
+    return jsonOut_({ ok:true, siteSlug: site, manual_block: manualBlock });
+  }
+
+  /* -------- client_billing (dados de cobrança) -------- */
+  if (type === "client_billing") {
+    const email = String(p.email || "").trim();
+    if (!email) return jsonOut_({ ok: false, error: "missing_email" });
+    
+    try {
+      const shCad = ss.getSheetByName("cadastros");
+      if (!shCad) return jsonOut_({ ok: false, error: "missing_sheet_cadastros" });
+      
+      const data = shCad.getDataRange().getValues();
+      const headers = data[0].map(h => String(h).trim());
+      const idxEmail = headers.indexOf("email");
+      const idxSite = headers.indexOf("siteSlug");
+      const idxPlan = headers.indexOf("plano");
+      const idxPreapproval = headers.indexOf("preapproval_id");
+      
+      if (idxEmail === -1) return jsonOut_({ ok: false, error: "missing_email_header" });
+      
+      const row = data.find(r => String(r[idxEmail] || "").trim() === email);
+      if (!row) return jsonOut_({ ok: false, error: "site_not_found" });
+      
+      const siteSlug = String(row[idxSite] || "");
+      const plan = String(row[idxPlan] || "essential");
+      const preapprovalId = String(row[idxPreapproval] || "");
+      
+      // Simular dados de cobrança (ajuste conforme seu sistema de pagamento)
+      const billing = {
+        ok: true,
+        plan: plan.toLowerCase(),
+        status: "active",
+        provider: "mercadopago",
+        next_renewal: new Date(Date.now() + 30*24*60*60*1000).toISOString(),
+        amount: plan.toLowerCase() === "vip" ? 197 : 97,
+        currency: "BRL",
+        preapproval_id: preapprovalId
+      };
+      
+      try {
+        ensureLogSheet_(ss).appendRow([
+          new Date(), "get_client_billing", "", "", "", "",
+          "client_billing", siteSlug, email, "ok", ""
+        ]);
+      } catch (_) {}
+      
+      return jsonOut_(billing);
+    } catch (e) {
+      try {
+        ensureLogSheet_(ss).appendRow([
+          new Date(), "get_client_billing_fail", "", "", "", "",
+          "client_billing", "", email, "error", String(e)
+        ]);
+      } catch (_) {}
+      return jsonOut_({ ok: false, error: String(e) });
+    }
+  }
+
+  /* -------- AdminDashboard helpers -------- */
+  if (type === "sites") {
+    return jsonOut_({ ok: true, siteSlugs: getSiteSlugs_() });
+  }
+
+  if (type === "status") {
+    // devolve objeto calculado por getStatusForSite_ (já com fallback de status)
+    var slug = normalizeSlug_(String(p.site || ""));
+    return jsonOut_(getStatusForSite_(slug));
+  }
+
+  /* -------- API do dashboard (GET) -------- */
+  if (type === "get_settings") {
+    var slugGetSettings = normalizeSlug_(String(p.site || ""));
+    return jsonOut_(getClientSettings_(slugGetSettings));
+  }
+
+  if (type === "list_leads") {
+    var slugLeads  = normalizeSlug_(String(p.site || ""));
+    var page       = parseInt(p.page || "1", 10)  || 1;
+    var pageSize   = parseInt(p.pageSize || "20", 10) || 20;
+    return jsonOut_(listLeads_(slugLeads, page, pageSize));
+  }
+
+  if (type === "list_feedbacks") {
+    var slugFb   = normalizeSlug_(String(p.site || ""));
+    var pageFb   = parseInt(p.page || "1", 10)  || 1;
+    var sizeFb   = parseInt(p.pageSize || "20", 10) || 20;
+    var isPublic = String(p.public || "").toLowerCase() === "1";
+    return jsonOut_(listFeedbacks_(slugFb, pageFb, sizeFb, { public: isPublic }));
+  }
+
+  if (type === "list_feedbacks_public") {
+    var slugFbP = normalizeSlug_(String(p.site || ""));
+    var pageFbP = parseInt(p.page || "1", 10)  || 1;
+    var sizeFbP = parseInt(p.pageSize || "20", 10) || 20;
+    return jsonOut_(listFeedbacksPublic_(slugFbP, pageFbP, sizeFbP));
+  }
+
+  if (type === "get_traffic") {
+    var slugTr = normalizeSlug_(String(p.site || ""));
+    var rng    = String(p.range || "30d");
+    return jsonOut_(getTraffic_(slugTr, rng));
+  }
+
+  // Lista imagens públicas do Drive do cliente
+  if (type === "assets") {
+    var slugA = normalizeSlug_(String(p.site || ""));
+    return handleAssetsList_(slugA);
+  }
+
+  // default
+  try {
+    ensureLogSheet_(ss).appendRow([ new Date(), "get_ignored", "", "", "", "", type || "", "", "", "", "" ]);
+  } catch (_) {}
+  return jsonOut_({ ok: false, error: "ignored_get" });
+}
+
+/** ===================== POST HANDLER (JSON + multipart + webhooks) ===================== */
+function doPost(e) {
+  const ss = openSS_();
+
+  // CORS preflight support
+  if (e && e.parameter && e.parameter.type === "options") {
+    return jsonOut_({ ok: true, message: "CORS preflight POST" });
+  }
+
+  // ===== header/entrada =====
+  const hasPD = !!(e && e.postData);
+  const contentType = hasPD ? String(e.postData.type || "") : "";
+  const rawLen = hasPD && e.postData && e.postData.contents ? String(e.postData.contents.length) : "0";
+  const hasFiles = !!(e && e.files && Object.keys(e.files || {}).length > 0);
+  const isMultipartHeader = hasPD && /^multipart\//i.test(contentType);
+  const isMultipart = hasFiles || isMultipartHeader;
+
+  log_(ss, "entry", {
+    contentType,
+    isMultipart: String(isMultipart),
+    hasPD: String(hasPD),
+    rawLen
+  });
+
+  // Parse mínimo p/ JSON (somente se NÃO multipart)
+  let data = {};
+  try {
+    if (hasPD && typeof e.postData.contents === "string" && !isMultipart) {
+      data = JSON.parse(e.postData.contents || "{}");
+    }
+  } catch (err) {
+    log_(ss, "json_parse_fail", { error: String(err) });
+    data = {};
+  }
+
+  // Ping rápido
+  if (data.type === "ping") {
+    log_(ss, "ping_ok", { note: "webapp alive" });
+    return jsonOut_({ ok: true, note: "webapp alive" });
+  }
+
+  try {
+    // ====== UPLOAD ======
+    const paramType = String(e && e.parameter && e.parameter.type || "");
+    if (isMultipart || hasFiles || paramType === "upload_files") {
+      log_(ss, "route_upload", { note: "upload_files", keys: Object.keys(e.parameter || {}).join(",") });
+      return handleUploadFiles_(ss, e);
+    }
+
+    // ===== ONBOARDING (salva formulário Obrigado) =====
+    if (data.type === "save_onboarding" || String(e.parameter && e.parameter.type || "") === "save_onboarding") {
+      return handleSaveOnboarding_(ss, data);
+    }
+
+    // ===== Gerar/atualizar apenas o prompt do Lovable (a partir do que já está em settings) =====
+    if (data.type === "generate_prompt" || String(e.parameter && e.parameter.type || "") === "generate_prompt") {
+      var siteGen = normalizeSlug_(String((data.siteSlug || (e.parameter && e.parameter.siteSlug) || (e.parameter && e.parameter.site) || "")));
+      return handleGeneratePrompt_(siteGen);
+    }
+
+    // ===== promover e.parameter -> data =====
+    var p = (e && e.parameter) ? e.parameter : {};
+    if (!data.type && p && p.type) {
+      data = Object.assign({}, data, { type: String(p.type || "") });
+      const promote = [
+        "event","action","plan","brand","order","email","fullName","document",
+        "phone","company","siteSlug","preapproval_id","logoUrl","fotosUrl",
+        "historia","produtos","fundacao","paleta","template","payment_id",
+        "collection_id","mp_payment_id","mp_preapproval_id","topic"
+      ];
+      promote.forEach(k => { if (p[k] && !data[k]) data[k] = p[k]; });
+    }
+
+    log_(ss, "parsed", {
+      type: data.type || "",
+      event: data.event || "",
+      keys: Object.keys(data || {}).join(",")
+    });
+
+    // ===== abas base =====
+    const shDados = ss.getSheetByName('dados');
+    const shCad   = ss.getSheetByName('cadastros');
+    if (shDados && shDados.getLastRow() === 0) {
+      shDados.appendRow(['timestamp','event','action','mp_id','preapproval_id','status','payer_email','amount','raw_json']);
+    }
+    if (shCad && shCad.getLastRow() === 0) {
+      shCad.appendRow(['timestamp','fullName','document','email','phone','company','siteSlug','plan','brand','order','preapproval_id','status','manual_block','updated_at']);
+    }
+
+    // ====== JSON/base64 (upload) ======
+    if (data.type === "upload_base64") {
+      log_(ss, "route_upload_base64", {});
+      return handleUploadBase64_(ss, data);
+    }
+
+    // ===== SESSIONS: receber defs do Lovable (Netlify onSuccess) =====
+    if (data.type === "sections_upsert_defs") {
+      // delega auth e persistência para a própria função (único ponto — removido duplicado)
+      return sectionsUpsertDefs_(ss, data);
+    }
+
+    // ===== SESSIONS: inicializar conteúdo (data) a partir do onboarding =====
+    if (data.type === "sections_bootstrap_from_onboarding") {
+      var siteB = normalizeSlug_(String(data.site || data.siteSlug || ''));
+      if (!siteB) return jsonOut_({ ok:false, error:'missing_site' });
+      var r2 = sectionsBootstrapFromOnboarding_(ss, siteB);
+      return jsonOut_(Object.assign({ ok:true, siteSlug: siteB }, r2));
+    }
+
+    // ---- Admin: setar/atualizar o hook de um site (opcional) ----
+    if (data.type === 'admin_set_hook') {
+      var props = PropertiesService.getScriptProperties();
+      var ADMIN = props.getProperty('ADMIN_DASH_TOKEN') || props.getProperty('ADMIN_TOKEN') || '';
+      if (!ADMIN || String(data.token || '') !== ADMIN) return jsonOut_({ ok:false, error:'unauthorized' });
+
+      var s = normalizeSlug_(String(data.siteSlug || ''));
+      var u = String(data.url || '').trim();
+      if (!s || !u) return jsonOut_({ ok:false, error:'missing_site_or_url' });
+
+      var r = upsertSiteBuildHook_(s, u);
+      return jsonOut_(Object.assign({ ok:true, siteSlug:s }, r));
+    }
+
+    // === Admin: setar manual_block via POST (JSON), com token ===
+    if (data.type === "admin_set") {
+      var props = PropertiesService.getScriptProperties();
+      var ADMIN = props.getProperty('ADMIN_DASH_TOKEN') || props.getProperty('ADMIN_TOKEN') || '';
+      var token = String(data.token || '');
+      if (!ADMIN || token !== ADMIN) {
+        log_(ss,"post_admin_set_fail",{ error:"unauthorized" });
+        return jsonOut_({ ok:false, error:"unauthorized" });
+      }
+
+      var site   = normalizeSlug_(String(data.site || data.siteSlug || ''));
+      var manual = String(data.manualBlock || data.block || '').toLowerCase();
+      var manualBlock = (manual === '1' || manual === 'true' || manual === 'yes' || manual === 'on');
+
+      if (!site) return jsonOut_({ ok:false, error:"missing_site" });
+
+      //⚠️ NÃO redeclare shCad aqui — já existe acima em doPost
+      if (!shCad) return jsonOut_({ ok:false, error:"missing_sheet_cadastros" });
+
+      var headers = shCad.getRange(1,1,1, shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+      var idxSite   = headers.indexOf('siteSlug');
+      if (idxSite === -1) return jsonOut_({ ok:false, error:'missing_siteSlug_header' });
+      var idxManual = headers.indexOf('manual_block');
+      var idxUpd    = headers.indexOf('updated_at');
+
+      // cria manual_block, se faltar
+      if (idxManual === -1) {
+        var lastCol = shCad.getLastColumn();
+        shCad.insertColumnAfter(lastCol);
+        shCad.getRange(1, lastCol + 1).setValue('manual_block');
+        headers   = shCad.getRange(1,1,1, shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+        idxManual = headers.indexOf('manual_block');
+      }
+      // cria updated_at, se faltar (carimbo útil)
+      if (idxUpd === -1) {
+        var lastCol2 = shCad.getLastColumn();
+        shCad.insertColumnAfter(lastCol2);
+        shCad.getRange(1, lastCol2 + 1).setValue('updated_at');
+        headers = shCad.getRange(1,1,1, shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+        idxUpd  = headers.indexOf('updated_at');
+      }
+
+      var last = shCad.getLastRow();
+      if (last < 2) return jsonOut_({ ok:false, error:'no_rows' });
+
+      var rng  = shCad.getRange(2,1, last-1, shCad.getLastColumn());
+      var rows = rng.getValues();
+
+      var updated = false;
+      for (var i = 0; i < rows.length; i++) {
+        var slugRow = normalizeSlug_(String(rows[i][idxSite] || ''));
+        if (slugRow === site) {
+          rows[i][idxManual] = manualBlock ? 'TRUE' : '';                   // padrão Sheets
+          if (idxUpd !== -1) rows[i][idxUpd] = new Date().toISOString();    // carimbo
+          updated = true;
+          break;
+        }
+      }
+      if (!updated) return jsonOut_({ ok:false, error:'site_not_found' });
+
+      rng.setValues(rows);
+      return jsonOut_({ ok:true, siteSlug: site, manual_block: manualBlock });
+    }
+
+    /* ===================== AUTH ===================== */
+    if (data.type === 'user_set_password')      { log_(ss,"route_user_set_password",{}); return userSetPassword_(ss, data); }
+    if (data.type === 'user_login')             { log_(ss,"route_user_login",{});        return userLogin_(ss, data); }
+    if (data.type === 'user_me')                { log_(ss,"route_user_me",{});           return userMe_(ss, data); }
+    if (data.type === 'password_reset_request') { log_(ss,"route_pwd_reset_req",{});     return passwordResetRequest_(ss, data); }
+    if (data.type === 'password_reset_confirm') { log_(ss,"route_pwd_reset_ok",{});      return passwordResetConfirm_(ss, data); }
+
+    // **NOVO**: Billing do cliente
+    if (data.type === 'client_billing')         { log_(ss,"route_client_billing",{});    return clientBilling_(ss, data); }
+
+    /* ===================== OVERRIDE (admin) ===================== */
+    // aceita também "manual_block" ou "admin_toggle" como aliases de override
+    if (data.type === 'override' || data.type === 'manual_block' || data.type === 'admin_toggle') {
+      log_(ss,"route_override",{});
+      return handleOverride_(data, shCad);
+    }
+
+    /* ==================== Eventos MP (webhook) ==================== */
+    if (data.event === 'payment' || data.event === 'preapproval' || data.event) {
+      log_(ss,"route_webhook", { event: data.event || "" });
+      shDados.appendRow([
+        new Date(),
+        data.event||'',
+        data.action||'',
+        data.mp_id||data.payment_id||data.collection_id||'',
+        data.preapproval_id||data.mp_preapproval_id||'',
+        data.status||'',
+        data.payer_email||'',
+        data.amount||'',
+        safeJson_(data)
+      ]);
+
+      // 🔄 Recalcular faturamento após salvar o evento
+      try {
+        var pre = data.preapproval_id || data.mp_preapproval_id || '';
+        recomputeBillingOne_(pre); // por enquanto recalcula tudo
+      } catch (err) {
+        log_(ss, "billing_recompute_fail", { error: String(err) });
+      }
+
+      return jsonOut_({ ok:true, wrote:'dados' });
+    }
+
+    /* ===================== Cadastro ===================== */
+    if (data.type === 'cadastro') {
+      log_(ss,"route_cadastro_start", { email: data.email || "", slug: data.siteSlug || "" });
+
+      const slug = normalizeSlug_(data.siteSlug || '');
+      const cpf  = onlyDigits_(data.document || '');
+
+      const errors = [];
+      if (!slug) errors.push('siteSlug_obrigatorio');
+      if (slug && (slug.length < 3 || slug.length > 30)) errors.push('siteSlug_tamanho_invalido');
+      if (slug && !/^[A-Z0-9-]+$/.test(slug)) errors.push('siteSlug_caracteres_invalidos');
+      if (slugExiste_(slug)) errors.push('siteSlug_ja_usado');
+      if (cpf && !isValidCPF_(cpf)) errors.push('cpf_invalido');
+
+      if (errors.length) {
+        log_(ss,"route_cadastro_fail", { error: errors.join("|") });
+        return jsonOut_({ ok:false, errors });
+      }
+
+      shCad.appendRow([
+        new Date(),
+        data.fullName||'',
+        cpf||'',
+        data.email||'',
+        data.phone||'',
+        data.company||'',
+        slug,
+        data.plan||'',
+        data.brand||'',
+        data.order||'',
+        data.preapproval_id||'',
+        '', // status
+        '', // manual_block
+        new Date().toISOString()
+      ]);
+
+      ensureUserRow_(data.email || '', slug);
+      log_(ss,"route_cadastro_ok",{ slug });
+      return jsonOut_({ ok:true, siteSlug: slug });
+    }
+
+    /* ===================== Onboarding ===================== */
+    if (data.type === 'onboarding') {
+      log_(ss,"route_onboarding_start", { email: data.email||"", slug: data.siteSlug||"", plan: data.plan||"" });
+      const r = handleOnboarding_(ss, data);
+      try {
+        const out = JSON.parse(r.getContent() || "{}");
+        log_(ss,"route_onboarding_done", { ok: String(out.ok), error: String(out.error||"") });
+      } catch (_) {}
+      return r;
+    }
+
+    // --- API do dashboard (POST)
+    if (data.type === "save_settings") {
+      return saveClientSettings_(ss, data);
+    }
+    // (único ponto de sections_upsert_defs já está acima)
+    if (data.type === "record_hit") {
+      return recordHit_(ss, data);
+    }
+
+    // CRIAR LEAD (POST)
+    if (data.type === "lead_new") {
+      return createLead_(ss, data);
+    }
+
+    // CRIAR FEEDBACK (POST)
+    if (data.type === "feedback_new") {
+      return createFeedback_(ss, data);
+    }
+    // Receber feedback público (site) — com email/phone opcionais
+    if (data.type === "submit_feedback") {
+      return createFeedback_(ss, data);
+    }
+
+    // Moderação: aprovar/ocultar (requer PIN salvo em settings_kv.security.vip_pin)
+    if (data.type === "feedback_set_approval") {
+      return feedbackSetApproval_(ss, data);
+    }
+
+    // ===== nada casou =====
+    log_(ss,"ignored", {
+      contentType,
+      isMultipart: String(isMultipart),
+      hasPD: String(hasPD),
+      rawLen,
+      type: data.type || "",
+      event: data.event || "",
+      keys: Object.keys(data||{}).join(",")
+    });
+    return jsonOut_({
+      ok: false,
+      error: 'ignored',
+      debug: {
+        hasPostData: hasPD,
+        contentType,
+        rawLen,
+        paramType: (p && p.type) ? String(p.type) : '',
+        seenKeys: Object.keys(data || {})
+      }
+    });
+
+  } catch (err) {
+    log_(ss,"fatal_error", { error: String(err) });
+    return jsonOut_({ ok:false, error: String(err) });
+  }
+}
+
+/** ================== OVERRIDE (admin) ================== */
+function handleOverride_(data, shCad) {
+  try {
+    var props  = PropertiesService.getScriptProperties();
+    var ADMIN  = props.getProperty('ADMIN_DASH_TOKEN') || props.getProperty('ADMIN_TOKEN') || '';
+    var token  = String(data.token || '');
+    if (!ADMIN || !token || token !== ADMIN) return jsonOut_({ ok:false, error:'unauthorized' });
+    if (!shCad) return jsonOut_({ ok:false, error:'missing_sheet' });
+
+    // ⚠️ headers TRIM para evitar espaços invisíveis
+    var headers = shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+    var idxSite   = headers.indexOf('siteSlug');       if (idxSite === -1) return jsonOut_({ ok:false, error:'missing_siteSlug_header' });
+    var idxManual = headers.indexOf('manual_block');   // pode não existir
+    var idxUpd    = headers.indexOf('updated_at');     // pode não existir
+
+    // cria manual_block se estiver faltando
+    if (idxManual === -1) {
+      var lastCol = shCad.getLastColumn();
+      shCad.insertColumnAfter(lastCol);
+      shCad.getRange(1, lastCol + 1).setValue('manual_block');
+      headers   = shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+      idxManual = headers.indexOf('manual_block');
+    }
+    // cria updated_at se estiver faltando (carimbo útil para debug)
+    if (idxUpd === -1) {
+      var lastCol2 = shCad.getLastColumn();
+      shCad.insertColumnAfter(lastCol2);
+      shCad.getRange(1, lastCol2 + 1).setValue('updated_at');
+      headers = shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(function(h){ return String(h).trim(); });
+      idxUpd  = headers.indexOf('updated_at');
+    }
+
+    var last = shCad.getLastRow(); if (last < 2) return jsonOut_({ ok:false, error:'no_rows' });
+    var rows = shCad.getRange(2, 1, last-1, shCad.getLastColumn()).getValues();
+
+    // rename (opcional)
+    if (String(data.action || '') === 'rename') {
+      var siteOld = normalizeSlug_(String(data.siteSlug || ''));
+      var siteNew = normalizeSlug_(String(data.renameTo || ''));
+      if (!siteOld || !siteNew) return jsonOut_({ ok:false, error:'missing_slugs' });
+      if (siteNew.length < 3 || siteNew.length > 30) return jsonOut_({ ok:false, error:'siteSlug_tamanho_invalido' });
+      if (!/^[A-Z0-9-]+$/.test(siteNew)) return jsonOut_({ ok:false, error:'siteSlug_caracteres_invalidos' });
+
+      // impede duplicidade do novo slug
+      for (var k = 0; k < rows.length; k++) {
+        var s = String(rows[k][idxSite] || '').trim().toUpperCase();
+        if (s === siteNew) return jsonOut_({ ok:false, error:'siteSlug_ja_usado' });
+      }
+      var renamed = false;
+      for (var i = 0; i < rows.length; i++) {
+        var sOld = String(rows[i][idxSite] || '').trim().toUpperCase();
+        if (sOld === siteOld) {
+          rows[i][idxSite] = siteNew;
+          if (idxUpd !== -1) rows[i][idxUpd] = new Date().toISOString();
+          renamed = true;
+          break;
+        }
+      }
+      if (!renamed) return jsonOut_({ ok:false, error:'site_not_found' });
+      shCad.getRange(2, 1, last-1, shCad.getLastColumn()).setValues(rows);
+      return jsonOut_({ ok:true, from:siteOld, to:siteNew });
+    }
+
+    // bloquear / desbloquear
+    var site = normalizeSlug_(String(data.siteSlug || ''));
+    var block = Boolean(data.block);
+    if (!site) return jsonOut_({ ok:false, error:'missing_siteSlug' });
+
+    var updated = false;
+    for (var j = 0; j < rows.length; j++) {
+      var slugJ = normalizeSlug_(String(rows[j][idxSite] || ''));
+      if (slugJ === site) {
+        // grava com string padrão do Sheets; vazio = desbloqueado
+        rows[j][idxManual] = block ? 'TRUE' : '';
+        if (idxUpd !== -1) rows[j][idxUpd] = new Date().toISOString();
+        updated = true;
+        break;
+      }
+    }
+    if (!updated) return jsonOut_({ ok:false, error:'site_not_found' });
+
+    shCad.getRange(2, 1, last-1, shCad.getLastColumn()).setValues(rows);
+    return jsonOut_({ ok:true, siteSlug:site, manual_block:block });
+
+  } catch (e) {
+    return jsonOut_({ ok:false, error:String(e) });
+  }
+}
+
+/* ================== AUTH (aba "usuarios") ================== */
+function userSetPassword_(ss, data) {
+  var props = PropertiesService.getScriptProperties();
+  var ADMIN = props.getProperty('ADMIN_DASH_TOKEN') || props.getProperty('ADMIN_TOKEN') || '';
+  var adminToken = String(data.adminToken || '');
+  if (!ADMIN || adminToken !== ADMIN) return jsonOut_({ ok:false, error:'unauthorized' });
+
+  var email = String(data.email || '').trim().toLowerCase();
+  var role  = String(data.role  || 'client').trim().toLowerCase();
+  var site  = normalizeSlug_(String(data.siteSlug || ''));
+  var pwd   = String(data.password || '');
+  if (!email || !pwd) return jsonOut_({ ok:false, error:'missing_email_or_password' });
+  if (role !== 'admin' && !site) return jsonOut_({ ok:false, error:'missing_siteSlug' });
+
+  var sh = ensureUsuariosSheet_(ss);
+  var idx = findUserRowByEmail_(sh, email);
+  var salt = makeSalt_();
+  var hash = sha256Hex_(salt + pwd);
+
+  if (idx === -1) sh.appendRow([email, site, role, hash, salt, '', '', '', '', '', '', '', '', '']);
+  else {
+    var row = idx + 2;
+    sh.getRange(row, 2).setValue(site);
+    sh.getRange(row, 3).setValue(role);
+    sh.getRange(row, 4).setValue(hash);
+    sh.getRange(row, 5).setValue(salt);
+  }
+  return jsonOut_({ ok:true, email, role, siteSlug:site });
+}
+function userLogin_(ss, data) {
+  var email = String(data.email || '').trim().toLowerCase();
+  var pwd   = String(data.password || '');
+  if (!email || !pwd) return jsonOut_({ ok:false, error:'missing_email_or_password' });
+
+  var sh = ensureUsuariosSheet_(ss);
+  var idx = findUserRowByEmail_(sh, email);
+  if (idx === -1) return jsonOut_({ ok:false, error:'not_found' });
+
+  var row = idx + 2;
+  var hash = String(sh.getRange(row, 4).getValue() || '').trim();
+  var salt = String(sh.getRange(row, 5).getValue() || '').trim();
+
+  var test = sha256Hex_(salt + pwd);
+  if (test !== hash) return jsonOut_({ ok:false, error:'invalid_credentials' });
+
+  sh.getRange(row, 6).setValue(new Date());
+  return jsonOut_({ ok:true, email });
+}
+function userMe_(ss, data) {
+  var email = String(data.email || '').trim().toLowerCase();
+  if (!email) return jsonOut_({ ok:false, error:'missing_email' });
+
+  var sh = ensureUsuariosSheet_(ss);
+  var idx = findUserRowByEmail_(sh, email);
+  if (idx === -1) return jsonOut_({ ok:false, error:'not_found' });
+
+  var row = idx + 2;
+  ensureBillingColumns_(sh);
+  var map = headerIndexMap_(sh);
+
+  var site = String(sh.getRange(row, map.siteSlug+1).getValue() || '').trim().toUpperCase();
+  var role = String(sh.getRange(row, map.role+1).getValue() || '').trim();
+
+  var planSaved = String(sh.getRange(row, map.plan+1).getValue() || '');
+  if (!planSaved) {
+    var planFromCad = getPlanForUser_(ss, email, site);
+    if (planFromCad) {
+      planSaved = planFromCad;
+      sh.getRange(row, map.plan+1).setValue(planSaved);
+    }
+  }
+  var planLc = String(planSaved || '').toLowerCase();
+  var plan   = planLc.indexOf('vip') !== -1 ? 'vip' : (planLc ? 'essential' : '');
+
+  var last = sh.getRange(row, map.last_login+1).getValue();
+  return jsonOut_({
+    ok:true, email, role, siteSlug:site,
+    plan: plan || 'essential',
+    last_login: last ? new Date(last).toISOString() : ''
+  });
+}
+function passwordResetRequest_(ss, data) {
+  var email = String(data.email || '').trim().toLowerCase();
+  if (!email) return jsonOut_({ ok:true });
+
+  var sh = ensureUsuariosSheet_(ss);
+  var idx = findUserRowByEmail_(sh, email);
+  if (idx === -1) return jsonOut_({ ok:true });
+
+  var row = idx + 2;
+  var token = Utilities.getUuid().replace(/-/g,'').substring(0,32);
+  var expires = new Date(Date.now() + 1000*60*30);
+
+  ensureResetColumns_(sh);
+  var map = headerIndexMap_(sh);
+  sh.getRange(row, map.reset_token+1).setValue(token);
+  sh.getRange(row, map.reset_expires+1).setValue(expires);
+
+  var link = "https://SEU-SITE/reset?email=" + encodeURIComponent(email) + "&token=" + token;
+  return jsonOut_({ ok:true, token: token, link: link });
+}
+function passwordResetConfirm_(ss, data) {
+  var email = String(data.email || '').trim().toLowerCase();
+  var token = String(data.token || '');
+  var password = String(data.password || '');
+  if (!email || !token || !password) return jsonOut_({ ok:false, error:'missing_params' });
+
+  var sh = ensureUsuariosSheet_(ss);
+  var idx = findUserRowByEmail_(sh, email);
+  if (idx === -1) return jsonOut_({ ok:false, error:'not_found' });
+
+  var row = idx + 2;
+  ensureResetColumns_(sh);
+  var map = headerIndexMap_(sh);
+
+  var savedTok = String(sh.getRange(row, map.reset_token+1).getValue() || '');
+  var expVal   = sh.getRange(row, map.reset_expires+1).getValue();
+
+  if (!savedTok || savedTok !== token)  return jsonOut_({ ok:false, error:'invalid_token' });
+  if (expVal && new Date(expVal).getTime() < Date.now()) return jsonOut_({ ok:false, error:'expired_token' });
+
+  var salt = makeSalt_();
+  var hash = sha256Hex_(salt + password);
+
+  sh.getRange(row, map.salt+1).setValue(salt);
+  sh.getRange(row, map.password_hash+1).setValue(hash);
+  sh.getRange(row, map.reset_token+1).setValue('');
+  sh.getRange(row, map.reset_expires+1).setValue('');
+
+  return jsonOut_({ ok:true });
+}
+
+/* ================== ONBOARDING (texto + prompt por plano) ================== */
+function handleOnboarding_(ss, data) {
+  var email = String(data.email || "").trim().toLowerCase();
+  var site  = normalizeSlug_(String(data.siteSlug || data.site || ""));
+  if (!email || !site) return jsonOut_({ ok:false, error:"missing_email_or_siteSlug" });
+
+  if (!gateAllowOnboarding_(ss, data)) {
+    return jsonOut_({ ok:false, error:"forbidden_onboarding" });
+  }
+
+  var plan    = String(data.plan || "").trim();
+  var logoUrl = String(data.logoUrl || "");
+  var fotosUrl= String(data.fotosUrl || data.fotosUrls || "");
+  var historia= String(data.historia || "");
+  var produtos= String(data.produtos || "");
+  var fundacao= String(data.fundacao || "");
+  var paleta  = String(data.paleta || data.paletteId || "");
+  var template= String(data.template || data.templateId || "");
+  var whatsapp= String(data.whatsapp || data.phone || "");
+  var empresa = String(data.empresa || data.company || "");
+  var enderecoRaw = data.endereco || data.address || "";
+  var endereco = "";
+  try {
+    if (typeof enderecoRaw === 'object') {
+      endereco = JSON.stringify(enderecoRaw);
+    } else {
+      endereco = String(enderecoRaw).trim();
+    }
+  } catch (e) {
+    endereco = String(enderecoRaw).trim();
+  }
+  var driveFolderUrl = String(data.drive_folder_url || "");
+
+  var sh = ensureOnboardingSheet_(ss);
+
+  // Usar driveFolderUrl do payload ou criar novo
+  if (!driveFolderUrl) {
+    driveFolderUrl = ensureClientFolderUrl_(site);
+  }
+  var lovablePrompt = buildLovablePrompt_({
+    plan: plan,
+    email: email,
+    siteSlug: site,
+    logoUrl: logoUrl,
+    fotosUrl: fotosUrl,
+    historia: historia,
+    produtos: produtos,
+    fundacao: fundacao,
+    paleta: paleta,
+    template: template
+  });
+
+  sh.appendRow([
+    new Date(), email, site, plan,
+    logoUrl, fotosUrl, historia, produtos,
+    fundacao, paleta, template,
+    driveFolderUrl, lovablePrompt
+  ]);
+
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var TEAM = props.getProperty('TEAM_EMAIL') || 'matheusmartinss@icloud.com';
+    MailApp.sendEmail({
+      to: TEAM,
+      subject: '[Elevea] Novo onboarding - ' + site,
+      htmlBody:
+        '<p><b>Cliente:</b> ' + email + '</p>' +
+        '<p><b>Site:</b> ' + site + '</p>' +
+        (plan ? '<p><b>Plano:</b> ' + plan + '</p>' : '') +
+        (driveFolderUrl ? ('<p><b>Pasta no Drive:</b> <a href="'+driveFolderUrl+'">'+driveFolderUrl+'</a></p>') : '') +
+        '<hr><p><b>Prompt Lovable:</b></p><pre style="white-space:pre-wrap">'+lovablePrompt.replace(/</g,'&lt;')+'</pre>'
+    });
+  } catch (_) {}
+
+  return jsonOut_({ ok:true });
+}
+
+function gateAllowOnboarding_(ss, data) {
+  var props  = PropertiesService.getScriptProperties();
+  var strict = String(props.getProperty("STRICT_ONBOARDING") || "").toLowerCase() === "true";
+  if (!strict) return true;
+
+  var mpid = String(data.payment_id || data.collection_id || data.mp_payment_id || "");
+  var pre  = String(data.preapproval_id || data.mp_preapproval_id || "");
+  var email = String(data.email || "").trim().toLowerCase();
+  var site  = normalizeSlug_(String(data.siteSlug || ""));
+
+  // 1) Caminho clássico: veio payment/preapproval → valida no "dados"
+  if (mpid || pre) {
+    var ok = hasApprovedEventForIds_(ss, mpid, pre);
+    if (!ok) return false;
+
+    // (Opcional) se quiser exigir matching por e-mail também quando vier id:
+    if (email && !emailMatchesEvent_(ss, email, mpid, pre)) return false;
+
+    return true;
+  }
+
+  // 2) Sem ids → fallback por e-mail recente aprovado
+  if (!email) return false;
+
+  var days = parseInt(String(props.getProperty("STRICT_ONBOARDING_EMAIL_DAYS") || "7"), 10);
+  if (isNaN(days) || days <= 0) days = 7;
+
+  var unique = String(props.getProperty("STRICT_ONBOARDING_EMAIL_UNIQUE") || "false").toLowerCase() === "true";
+
+  var okRecent = hasRecentApprovedEventForEmail_(ss, email, days);
+  if (!okRecent) return false;
+
+  // 3) (Opcional) Se UNIQUE=true, não permitir onboarding com esse e-mail já usado em outro site
+  if (unique && !emailAvailableForOnboarding_(ss, email, site)) return false;
+
+  return true;
+}
+
+/* ================== Upload multipart (robusto + diagnóstico) ================== */
+function handleUploadFiles_(ss, e) {
+  try {
+    var email = String(e.parameter.email || "").trim().toLowerCase();
+    var site  = normalizeSlug_(String(e.parameter.siteSlug || ""));
+    if (!email || !site) return jsonOut_({ ok:false, error:"Faltou e-mail ou siteSlug." });
+
+    var folderUrl = ensureClientFolderUrl_(site);
+    if (!folderUrl) return jsonOut_({ ok:false, error:"Pasta do Drive não está configurada (DRIVE_PARENT_FOLDER_ID)." });
+
+    var folderId    = folderUrl.split('/').pop();
+    var root        = DriveApp.getFolderById(folderId);
+    var logoFolder  = getOrCreateSub_(root, "logo");
+    var fotosFolder = getOrCreateSub_(root, "fotos");
+
+    var saved = [];
+
+    // Links opcionais
+    var logoLink  = String(e.parameter.logoLink  || "");
+    var fotosLink = String(e.parameter.fotosLink || "");
+    if (logoLink || fotosLink) {
+      var lines = [];
+      if (logoLink)  lines.push("logoLink: "  + logoLink);
+      if (fotosLink) lines.push("fotosLink: " + fotosLink);
+      try {
+        var linkFile = root.createFile("links.txt", lines.join("\n"));
+        saved.push(linkFile.getName());
+      } catch (_) {}
+    }
+
+    // Blobs do multipart (Apps Script preenche e.files)
+    var filesObj = (e && e.files) ? e.files : null;
+
+    function saveBlob(fieldName, blob) {
+      if (!blob) return;
+      var originalName = "";
+      try { originalName = String(blob.getName() || "upload"); } catch(_) { originalName = "upload"; }
+      var m = /\.([^.]+)$/.exec(originalName);
+      var ext = m ? ("." + m[1]) : "";
+      var base = originalName.replace(/\.[^.]+$/, "");
+      var newName = base + "-" + Utilities.getUuid().slice(0,8) + ext;
+      try { blob.setName(newName); } catch(_) {}
+      var target = (fieldName === "logo") ? logoFolder : fotosFolder;
+      var file = target.createFile(blob);
+      try { file.setDescription("Upload Elevea (" + site + ") - campo: " + fieldName); } catch(_) {}
+      saved.push(file.getName());
+    }
+
+    if (filesObj) {
+      if (filesObj.logo) {
+        if (typeof filesObj.logo.getBytes === "function")      saveBlob("logo",  filesObj.logo);
+        else if (typeof filesObj.logo.length === "number")     for (var i=0;i<filesObj.logo.length;i++) saveBlob("logo", filesObj.logo[i]);
+      }
+      if (filesObj.fotos) {
+        if (typeof filesObj.fotos.getBytes === "function")     saveBlob("fotos", filesObj.fotos);
+        else if (typeof filesObj.fotos.length === "number")    for (var j=0;j<filesObj.fotos.length;j++) saveBlob("fotos", filesObj.fotos[j]);
+      }
+      var keys = Object.keys(filesObj);
+      for (var k=0; k<keys.length; k++) {
+        var key = keys[k];
+        if (key === "logo" || key === "fotos") continue;
+        if (/^fotos\d+$/i.test(key)) saveBlob("fotos", filesObj[key]);
+        if (/^logo\d+$/i.test(key))  saveBlob("logo",  filesObj[key]);
+      }
+    }
+
+    // Se nada foi salvo, escrever diagnóstico dentro da pasta
+    if (saved.length === 0) {
+      try {
+        var diag = [
+          "=== UPLOAD DEBUG ===",
+          "date: " + new Date().toISOString(),
+          "contentType: " + (e && e.postData ? String(e.postData.type || "") : ""),
+          "hasPostData: " + (!!(e && e.postData)),
+          "rawLen: " + (e && e.postData && e.postData.contents ? String(e.postData.contents.length) : "0"),
+          "filesKeys: " + (filesObj ? Object.keys(filesObj).join(",") : "(no files)"),
+          "paramKeys: " + (e && e.parameter ? Object.keys(e.parameter).join(",") : "(no params)")
+        ].join("\n");
+        var dbg = root.createFile("UPLOAD_DEBUG.txt", diag);
+        saved.push(dbg.getName());
+      } catch (_) {}
+    }
+
+    // Registro leve + logs
+    var sh = ensureOnboardingSheet_(ss);
+    sh.appendRow([
+      new Date(), email, site, "",
+      "(upload)", "(upload)", "", "", "", "", "",
+      root.getUrl(), "FILES:" + (saved.length ? saved.join(", ") : "(nenhum arquivo detectado)")
+    ]);
+
+    log_(ss, "upload_done", {
+      type: "upload_files",
+      keys: filesObj ? Object.keys(filesObj).join(",") : "(no files)",
+      note: "saved=" + saved.length
+    });
+
+    return jsonOut_({ ok:true, driveFolderUrl: root.getUrl(), saved: saved });
+  } catch (err) {
+    log_(ss, "upload_error", { error: String(err) });
+    return jsonOut_({ ok:false, error:String(err) });
+  }
+}
+
+/** ================== Sheets / Drive helpers ================== */
+function ensureOnboardingSheet_(ss) {
+  var sh = ss.getSheetByName("onboarding");
+  if (!sh) sh = ss.insertSheet("onboarding");
+  if (sh.getLastRow() === 0) {
+    sh.appendRow([
+      "timestamp","email","siteSlug","plan",
+      "logoUrl","fotosUrl","historia","produtos","fundacao","paleta","template",
+      "drive_folder_url","lovable_prompt"
+    ]);
+  }
+  return sh;
+}
+
+function ensureClientFolderUrl_(site) {
+  try {
+    site = normalizeSlug_(String(site || ""));
+    if (!site) return "";
+
+    // pasta raiz única da Elevea
+    var it = DriveApp.getFoldersByName("Elevea Sites");
+    var parent = it.hasNext() ? it.next() : DriveApp.createFolder("Elevea Sites");
+
+    var folderName = "SITE-" + site;
+    var it2 = parent.getFoldersByName(folderName);
+    var folder = it2.hasNext() ? it2.next() : parent.createFolder(folderName);
+
+    // subpastas
+    function ensureSub(name) {
+      try {
+        var s = folder.getFoldersByName(name);
+        return s.hasNext() ? s.next() : folder.createFolder(name);
+      } catch (subErr) {
+        console.error("Error creating subfolder " + name + ":", subErr);
+        return null;
+      }
+    }
+    ensureSub("logo");
+    ensureSub("fotos");
+
+    return folder.getUrl();
+  } catch (e) {
+    console.error("Error in ensureClientFolderUrl_:", e);
+    return "";
+  }
+}
+
+/** ===== Paletas & Templates (catálogo) ===== */
+function paletteMap_(id) {
+  var map = {
+    "dourado":  { name: "Dourado elegante", colors: ["#b98a2f","#111","#f6f3ee"] },
+    "azul":     { name: "Azul confiança",   colors: ["#1e3a8a","#0f172a","#f1f5f9"] },
+    "verde":    { name: "Verde natural",    colors: ["#166534","#081f0f","#def7e7"] },
+    "vermelho": { name: "Vermelho vibrante",colors: ["#b91c1c","#111","#fa7a22"] },
+    "preto":    { name: "Preto & Branco",   colors: ["#111","#fff","#e5e7eb"] },
+    "escuro":   { name: "Dark/Neon",        colors: ["#0b1220","#0c151c","#39ff88"] },
+    "claro":    { name: "Light clean",      colors: ["#ffffff","#111827","#e5e7eb"] },
+  };
+  return map[id] || { name:"Personalizada", colors:[] };
+}
+
+function templateMap_(id) {
+  var map = {
+    "classico":  { name:"Clássico",  descricao:"Hero simples, seção sobre, serviços em cards, CTA WhatsApp." },
+    "moderno":   { name:"Moderno",   descricao:"Grid de serviços, depoimentos, destaque para WhatsApp e mapa." },
+    "minimal":   { name:"Minimal",   descricao:"Seções amplas, tipografia forte e foco no CTA." },
+    "navegacao": { name:"Âncoras",   descricao:"Nav flutuante com rolagem por sessões." },
+  };
+  return map[id] || { name:"Custom", descricao:"" };
+}
+
+/** ================== PROMPT (Lovable) – CLIENTE ================== */
+function buildLovablePrompt_(ctx) {
+  var plan      = String(ctx.plan || "").toLowerCase();          // "vip" | "essential"
+  var site      = String(ctx.siteSlug || "").toUpperCase();
+  var email     = String(ctx.email || "");
+  var logoUrl   = String(ctx.logoUrl || "");
+  var fotosUrl  = String(ctx.fotosUrl || "");
+  var historia  = String(ctx.historia || "");
+  var produtos  = String(ctx.produtos || "");
+  var fundacao  = String(ctx.fundacao || "");
+  var paletaId  = String(ctx.paleta || "");
+  var template  = String(ctx.template || "");
+
+  var L = [];
+
+  /* — Objetivo */
+  L.push("Crie uma landing institucional (one-page) completa para um pequeno negócio local.");
+  L.push("Use Vite + React + TypeScript + Tailwind. Uma única rota pública '/' (sem telas logadas).");
+  L.push("Hospedagem Netlify. O repositório terá `src/elevea.sections.json` e um script de pós-deploy que envia esse JSON ao meu GAS.");
+
+  /* — ENV VARS (Netlify) que você deve ler no build/runtime */
+  L.push("Variáveis do Netlify que DEVEM ser usadas:");
+  L.push("- ELEVEA_SITE_SLUG      → slug MAIÚSCULO do site (ex.: ACME-MOTOS)");
+  L.push("- ELEVEA_GAS_URL        → URL do GAS (/exec)");
+  L.push("- ELEVEA_ADMIN_TOKEN    → token igual ao ADMIN_DASH_TOKEN no GAS (para publicar sections)");
+  L.push("- ELEVEA_STATUS_URL     → (opcional) mesma URL do GAS para checar status e carregar settings");
+
+  /* — Mapa de sessões obrigatório (IDs estáveis) */
+  L.push("Gere um arquivo **src/elevea.sections.json** com um array de sessões. IDs estáveis em kebab-case:");
+  L.push(`
+[
+  { "id":"header", "name":"Cabeçalho", "fields":[
+      { "key":"brand","label":"Nome da marca" },
+      { "key":"nav_links","label":"Links do menu (âncoras)", "hint":"#sobre,#servicos,#depoimentos,#contato" }
+    ]},
+  { "id":"hero", "name":"Hero", "fields":[
+      { "key":"title","label":"Título" },
+      { "key":"subtitle","label":"Subtítulo" },
+      { "key":"cta_whatsapp","label":"Link WhatsApp" }
+    ], "slots":[ { "key":"hero_img","label":"Imagem principal" } ]},
+  { "id":"sobre","name":"Sobre","fields":[ { "key":"about","label":"Texto Sobre" } ]},
+  { "id":"servicos","name":"Produtos/Serviços","fields":[ { "key":"list","label":"Lista (texto livre)" } ]},
+  { "id":"destaques","name":"Destaques","fields":[ { "key":"bullets","label":"Pontos fortes (lista)" } ]},
+  { "id":"depoimentos","name":"Depoimentos","fields":[]},
+  { "id":"contato","name":"Contato","fields":[
+      { "key":"email","label":"E-mail" },
+      { "key":"whatsapp","label":"WhatsApp" },
+      { "key":"address","label":"Endereço" },
+      { "key":"maps_url","label":"Google Maps URL" },
+      { "key":"instagram","label":"Instagram" },
+      { "key":"facebook","label":"Facebook" },
+      { "key":"tiktok","label":"TikTok" }
+    ]}
+]`.trim());
+
+  /* — Script pós-deploy (Netlify onSuccess) para publicar defs no GAS */
+  L.push("Crie `tools/elevea-sync-sections.mjs` (Node 18+, sem libs externas): lê `src/elevea.sections.json` e POST em ELEVEA_GAS_URL:");
+  L.push(`
+import fs from "node:fs";
+const GAS=process.env.ELEVEA_GAS_URL, SITE=process.env.ELEVEA_SITE_SLUG, ADMIN=process.env.ELEVEA_ADMIN_TOKEN;
+if (GAS && SITE && ADMIN && fs.existsSync("src/elevea.sections.json")) {
+  const defs = JSON.parse(fs.readFileSync("src/elevea.sections.json","utf8"));
+  await fetch(GAS,{ method:"POST", headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ type:"sections_upsert_defs", site:SITE, defs, adminToken:ADMIN })
+  });
+}`.trim());
+
+  /* — netlify.toml hook */
+  L.push("Adicione ao `netlify.toml`:");
+  L.push(`
+[build]
+command = "npm run build"
+publish = "dist"
+[[build.lifecycle.onSuccess]]
+  command = "node tools/elevea-sync-sections.mjs"
+`.trim());
+
+  /* — Carregador de settings (status + settings_kv) */
+  L.push("Implemente `src/lib/elevea.ts` com:");
+  L.push(`
+const GAS = import.meta.env.ELEVEA_STATUS_URL || import.meta.env.ELEVEA_GAS_URL;
+const SLUG = import.meta.env.ELEVEA_SITE_SLUG;
+export async function loadSettings(){
+  try{
+    const r = await fetch(\`\${GAS}?type=get_settings&site=\${encodeURIComponent(SLUG)}\`, { cache:"no-store" });
+    const j = await r.json(); return j?.settings || {};
+  }catch{ return {}; }
+}
+`.trim());
+
+  /* — Construção da página usando o onboarding (placeholders) */
+  L.push("Monte a landing **já preenchida** com placeholders vindos do briefing abaixo:");
+  if (site)     L.push("• Slug: " + site);
+  if (email)    L.push("• Contato: " + email);
+  if (historia) L.push("• História: " + historia);
+  if (produtos) L.push("• Produtos/Serviços: " + produtos);
+  if (fundacao) L.push("• Fundada em: " + fundacao);
+  if (paletaId) L.push("• Paleta: " + paletaId);
+  if (template) L.push("• Template: " + template);
+  if (logoUrl)  L.push("• Logo (ref): " + logoUrl);
+  if (fotosUrl) L.push("• Pasta de fotos (ref): " + fotosUrl);
+
+  L.push("Se houver endereço depois no settings, gere o bloco Mapa com `iframe` do Google Maps usando a query do endereço.");
+  L.push("Cabeçalho fixo (flutuante), menu com âncoras (#sobre, #servicos, #depoimentos, #contato), botão flutuante do WhatsApp.");
+  L.push("Rodapé com endereço (texto), link 'Como chegar' (maps), redes sociais (se preenchidas), e e-mail/WhatsApp.");
+
+  /* — VIP vs Essencial */
+  if (plan === "vip") {
+    L.push("Plano VIP: destaque áreas editáveis (títulos/textos/imagens/cores) e inclua seção 'Depoimentos' com placeholder (será alimentada via back-end).");
+  } else {
+    L.push("Plano Essencial: mantenha a mesma estrutura, porém como conteúdo estático (sem UI de edição).");
+  }
+
+  /* — Render por IDs, nunca por nomes fixos */
+  L.push("Na Home (`src/pages/Index.tsx`), carregue `defs` de `src/elevea.sections.json` e os valores via `loadSettings()`.");
+  L.push("Para cada `sec` em `defs`, renderize a seção por ID; use valores `settings.sections.data[sec.id]` se existirem, senão placeholders do briefing.");
+
+  return L.join("\\n");
+}
+
+/**
+ * Regera e persiste o prompt com base no último registro do site (settings ou onboarding).
+ */
+function handleGeneratePrompt_(site) {
+  site = normalizeSlug_(String(site || ""));
+  if (!site) return jsonOut_({ ok:false, error:"missing_siteSlug" });
+
+  var ss = openSS_();
+
+  // 1) tentar ler o último registro normalizado da aba "settings"
+  var shS = ss.getSheetByName("settings");
+  var found = null, rowIdx = -1, head = [];
+  if (shS && shS.getLastRow() >= 2) {
+    head = shS.getRange(1,1,1,shS.getLastColumn()).getValues()[0].map(String);
+    var iSite = head.indexOf("siteSlug");
+    for (var r = shS.getLastRow(); r >= 2; r--) {
+      var s = String(shS.getRange(r, iSite+1).getValue() || "").trim().toUpperCase();
+      if (s === site) { rowIdx = r; break; }
+    }
+    if (rowIdx !== -1) {
+
+/* DUPLICATE REMOVED: function G (smaller copy) */
+
+      var palette_id = G("palette_id");
+      var template   = G("template_id");
+      var colors     = []; try { colors = JSON.parse(G("colors_json")||"[]"); } catch(_){}
+      var fotos      = []; try { fotos = JSON.parse(G("fotos_urls_json")||"[]"); } catch(_){}
+
+      found = {
+        plan:       G("plano") || "",
+        email:      G("email"),
+        siteSlug:   site,
+        logoUrl:    G("logo_url"),
+        fotosUrl:   (fotos[0] || ""),
+        historia:   G("historia"),
+        produtos:   G("produtos"),
+        fundacao:   G("fundacao"),
+        paleta:     palette_id,
+        template:   template
+      };
+    }
+  }
+
+  // 2) fallback: tentar "onboarding" bruto (caso settings ainda não exista)
+  if (!found) {
+    var shO = ss.getSheetByName("onboarding");
+    if (shO && shO.getLastRow() >= 2) {
+      var hO = shO.getRange(1,1,1,shO.getLastColumn()).getValues()[0].map(String);
+      var iSiteO = hO.indexOf("siteSlug");
+      var rO = -1;
+      for (var rr = shO.getLastRow(); rr >= 2; rr--) {
+        var sO = String(shO.getRange(rr, iSiteO+1).getValue() || "").trim().toUpperCase();
+        if (sO === site) { rO = rr; break; }
+      }
+      if (rO !== -1) {
+        function GO(name){ var i = hO.indexOf(name); return i===-1 ? "" : String(shO.getRange(rO, i+1).getValue() || ""); }
+        found = {
+          plan:       GO("plan") || "",
+          email:      GO("email"),
+          siteSlug:   site,
+          logoUrl:    GO("logoUrl"),
+          fotosUrl:   GO("fotosUrl"),
+          historia:   GO("historia"),
+          produtos:   GO("produtos"),
+          fundacao:   GO("fundacao"),
+          paleta:     GO("paleta"),
+          template:   GO("template")
+        };
+      }
+    }
+  }
+
+  if (!found) return jsonOut_({ ok:false, error:"no_data_for_site" });
+
+  // 3) gerar o prompt e salvar de volta
+  var prompt = buildLovablePrompt_(found);
+
+  // 3a) atualiza/insere em "settings" a coluna lovable_prompt
+  var sh = ss.getSheetByName("settings");
+  if (!sh) {
+    sh = ss.insertSheet("settings");
+    sh.appendRow(["timestamp","siteSlug","email","whatsapp","empresa","endereco","historia","produtos","fundacao","palette_id","palette_name","colors_json","template_id","template_name","logo_url","fotos_urls_json","drive_folder_url","plano","lovable_prompt"]);
+  }
+  var last = sh.getLastRow();
+  var hdr  = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  var iSiteS = hdr.indexOf("siteSlug");
+  var rowFound = 0;
+  if (iSiteS !== -1 && last >= 2) {
+    var vals = sh.getRange(2, iSiteS+1, last-1, 1).getValues();
+    for (var i=0;i<vals.length;i++){ if (String(vals[i][0]||"").trim().toUpperCase() === site) { rowFound = i+2; break; } }
+  }
+  var iPrompt = hdr.indexOf("lovable_prompt");
+  if (iPrompt === -1) {
+    sh.getRange(1, sh.getLastColumn()+1).setValue("lovable_prompt");
+    // refresh header depois de inserir a coluna:
+    hdr = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+    iPrompt = hdr.indexOf("lovable_prompt");
+  }
+  var rowToWrite = rowFound;
+  if (!rowFound) {
+    sh.insertRowsAfter(last || 1, 1);
+    rowToWrite = (last || 1) + 1;
+  }
+  // garante siteSlug e timestamp
+  if (iSiteS !== -1) sh.getRange(rowToWrite, iSiteS+1).setValue(site);
+  sh.getRange(rowToWrite, 1).setValue(new Date()); // timestamp na 1ª coluna
+  // grava prompt
+  sh.getRange(rowToWrite, iPrompt+1).setValue(prompt);
+
+  return jsonOut_({ ok:true, siteSlug: site, lovable_prompt: prompt });
+}
+
+function handleSaveOnboarding_(ss, data) {
+  try {
+    var site = normalizeSlug_(String(data.siteSlug || data.site || ""));
+    if (!site) return jsonOut_({ ok:false, error:"missing_site" });
+
+    var email      = String(data.email || "").trim().toLowerCase();
+    var whatsapp   = String(data.whatsapp || data.phone || "").trim();
+    var empresa    = String(data.empresa || data.company || "").trim();
+    var enderecoRaw = data.endereco || data.address || "";
+    var endereco = "";
+    try {
+      if (typeof enderecoRaw === 'object') {
+        endereco = JSON.stringify(enderecoRaw);
+      } else {
+        endereco = String(enderecoRaw).trim();
+      }
+    } catch (e) {
+      endereco = String(enderecoRaw).trim();
+    }
+
+    var historia   = String(data.historia || data.about || "");
+    var produtos   = String(data.produtos || "").trim();
+    var fundacao   = String(data.fundacao || "");
+
+    var paletteId  = String(data.paletteId || data.paleta || "").toLowerCase();
+    var templateId = String(data.templateId || data.template || "").toLowerCase();
+
+    var paleta     = paletteMap_(paletteId);
+    var template   = templateMap_(templateId);
+
+    var folderUrl = String(data.drive_folder_url || data.driveFolderUrl || "") || ensureClientFolderUrl_(site);
+    if (!folderUrl) return jsonOut_({ ok:false, error:"no_drive_folder" });
+
+    var logoUrl    = String(data.logoUrl || "");
+    var fotosUrls  = [];
+    try {
+      if (Array.isArray(data.fotosUrls)) fotosUrls = data.fotosUrls;
+      else if (typeof data.fotosUrls === "string" && data.fotosUrls.trim()) {
+        fotosUrls = data.fotosUrls.split(",").map(function(s){ return s.trim(); }).filter(Boolean);
+      }
+    } catch (_) {}
+
+    var plano = String(data.plano || data.plan || "").toLowerCase(); // "vip" | "essential"
+
+    var settings = {
+      identity: { empresa: empresa, slug: site, whatsapp: whatsapp, email: email, endereco: endereco },
+      content:  { historia: historia, produtos: produtos, fundacao: fundacao },
+      visual:   {
+        paletteId: paletteId, paletteName: paleta.name, colors: paleta.colors,
+        templateId: templateId, templateName: template.name
+      },
+      media:    { drive_folder_url: folderUrl, logoUrl: logoUrl, fotosUrls: fotosUrls },
+      plan:     { plano: plano }
+    };
+
+    // Prompt completo e padronizado (usa a mesma função do onboarding principal)
+    var lovablePrompt = buildLovablePrompt_({
+      plan: plano,
+      email: email,
+      siteSlug: site,
+      logoUrl: logoUrl,
+      fotosUrl: (fotosUrls && fotosUrls[0]) || "",
+      historia: historia,
+      produtos: produtos,
+      fundacao: fundacao,
+      paleta: paletteId,
+      template: templateId
+    });
+
+    var sh = ss.getSheetByName("settings");
+    if (!sh) {
+      sh = ss.insertSheet("settings");
+      sh.appendRow(["timestamp","siteSlug","email","whatsapp","empresa","endereco","historia","produtos","fundacao","palette_id","palette_name","colors_json","template_id","template_name","logo_url","fotos_urls_json","drive_folder_url","plano","lovable_prompt"]);
+    }
+
+    // upsert por siteSlug
+    var last = sh.getLastRow();
+    var header = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String).map(function(s){return s.trim();});
+    var siteCol = header.indexOf("siteSlug")+1;
+    var rowFound = 0;
+    if (siteCol > 0 && last >= 2) {
+      var values = sh.getRange(2, siteCol, last-1, 1).getValues();
+      for (var i=0;i<values.length;i++){ if (String(values[i][0]) === site) { rowFound = i+2; break; } }
+    }
+    var row = [
+      new Date(), site, email, whatsapp, empresa, endereco,
+      historia, produtos, fundacao,
+      paletteId, paleta.name, JSON.stringify(paleta.colors || []),
+      templateId, template.name,
+      logoUrl, JSON.stringify(fotosUrls || []),
+      folderUrl, plano,
+      lovablePrompt
+    ];
+    if (rowFound) sh.getRange(rowFound, 1, 1, row.length).setValues([row]);
+    else sh.appendRow(row);
+
+    // garante usuário/relacionamento
+    try {
+      upsertCadastroAndUser_(ss, { site: site, email: email, whatsapp: whatsapp, plano: (plano || 'essential') });
+    } catch (e) { log_(ss, 'onboarding_user_create_fail', { error: String(e), site: site, email: email }); }
+
+    return jsonOut_({ ok:true, siteSlug: site, driveFolderUrl: folderUrl });
+  } catch (err) {
+    return jsonOut_({ ok:false, error:String(err && err.message || err) });
+  }
+}
+
+/** ================== Helpers gerais ================== */
+function ensureUserRow_(email, siteSlug) {
+  email = String(email || '').trim().toLowerCase();
+  if (!email) return;
+  var ss = openSS_();
+  var sh = ss.getSheetByName('usuarios') || ss.insertSheet('usuarios');
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['email','siteSlug','role','password_hash','salt','last_login','reset_token','reset_expires','plan','billing_status','billing_next','billing_amount','billing_currency','billing_provider']);
+  } else {
+    ensureBillingColumns_(sh);
+  }
+  var last = sh.getLastRow();
+  var vals = last > 1 ? sh.getRange(2,1,last-1,1).getValues() : [];
+  for (var i=0;i<vals.length;i++){
+    if (String(vals[i][0]||'').toLowerCase() === email) return;
+  }
+  sh.appendRow([ email, siteSlug || '', 'client', '', '', '', '', '', '', '', '', '', '', '' ]);
+}
+function ensureUsuariosSheet_(ss) {
+  var sh = ss.getSheetByName('usuarios'); if (!sh) sh = ss.insertSheet('usuarios');
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['email','siteSlug','role','password_hash','salt','last_login','reset_token','reset_expires','plan','billing_status','billing_next','billing_amount','billing_currency','billing_provider']);
+  } else {
+    ensureBillingColumns_(sh);
+  }
+  return sh;
+}
+function ensureResetColumns_(sh){
+  var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  function ensure(name){
+    if (!headers.includes(name)) {
+      sh.getRange(1, sh.getLastColumn()+1).setValue(name);
+      headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+    }
+  }
+  ensure('reset_token');
+  ensure('reset_expires');
+}
+function ensureBillingColumns_(sh){
+  var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+
+/* DUPLICATE REMOVED: function ensure (smaller copy) */
+
+  ensure('plan');
+  ensure('billing_status');
+  ensure('billing_next');
+  ensure('billing_amount');
+  ensure('billing_currency');
+  ensure('billing_provider');
+}
+function headerIndexMap_(sh){
+  var h = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  var map = {}; for (var i=0;i<h.length;i++){ map[h[i]] = i; }
+  map.email = map.email ?? 0; 
+  map.siteSlug = map.siteSlug ?? 1; 
+  map.role = map.role ?? 2;
+  map.password_hash = map.password_hash ?? 3; 
+  map.salt = map.salt ?? 4; 
+  map.last_login = map.last_login ?? 5;
+  map.reset_token = (typeof map['reset_token'] === 'number') ? map['reset_token'] : 6;
+  map.reset_expires = (typeof map['reset_expires'] === 'number') ? map['reset_expires'] : 7;
+  map.plan = (typeof map['plan'] === 'number') ? map['plan'] : 8;
+  map.billing_status = (typeof map['billing_status'] === 'number') ? map['billing_status'] : 9;
+  map.billing_next = (typeof map['billing_next'] === 'number') ? map['billing_next'] : 10;
+  map.billing_amount = (typeof map['billing_amount'] === 'number') ? map['billing_amount'] : 11;
+  map.billing_currency = (typeof map['billing_currency'] === 'number') ? map['billing_currency'] : 12;
+  map.billing_provider = (typeof map['billing_provider'] === 'number') ? map['billing_provider'] : 13;
+  return map;
+}
+function findUserRowByEmail_(sh, emailLc) {
+  var last = sh.getLastRow(); if (last < 2) return -1;
+  var values = sh.getRange(2,1,last-1,1).getValues();
+  for (var i=0;i<values.length;i++) {
+    var v = String(values[i][0] || '').trim().toLowerCase();
+    if (v === emailLc) return i;
+  }
+  return -1;
+}
+function getPlanForUser_(ss, emailLc, siteSlug) {
+  try {
+    var sh = ss.getSheetByName('cadastros'); 
+    if (!sh) return '';
+    var last = sh.getLastRow(); if (last < 2) return '';
+    var headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+    var idxEmail = headers.indexOf('email');
+    var idxSite  = headers.indexOf('siteSlug');
+    var idxPlan  = headers.indexOf('plan');
+    if (idxPlan === -1) return '';
+    var rows = sh.getRange(2,1,last-1,sh.getLastColumn()).getValues();
+
+    var plan = '';
+    for (var i = rows.length - 1; i >= 0; i--) {
+      var r = rows[i];
+      var e = String(r[idxEmail]||'').trim().toLowerCase();
+      var s = String(r[idxSite]||'').trim().toUpperCase();
+      if ((emailLc && e === emailLc) || (siteSlug && s === siteSlug)) {
+        plan = String(r[idxPlan]||'');
+        break;
+      }
+    }
+    return plan;
+  } catch (_) { return ''; }
+}
+function makeSalt_() {
+  var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, Utilities.getUuid());
+  return bytesToHex_(bytes).substring(0, 32);
+}
+function sha256Hex_(txt) {
+  var raw = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, txt);
+  return bytesToHex_(raw);
+}
+function bytesToHex_(bytes) {
+  var hex = '';
+  for (var i=0;i<bytes.length;i++) {
+    var val = bytes[i]; if (val < 0) val += 256;
+    var b = val.toString(16); if (b.length === 1) hex += '0';
+    hex += b;
+  }
+  return hex;
+}
+function normalizeSlug_(v) {
+  v = String(v || '').trim().toUpperCase();
+  v = v.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); // remove acentos
+  v = v.replace(/\s+/g, '-').replace(/[^A-Z0-9-]/g, '');  // só A-Z, 0-9 e -
+  v = v.replace(/-+/g, '-').replace(/^-+|-+$/g, '');      // colapsa e trim de -
+  return v;
+}
+function onlyDigits_(v) { return String(v || '').replace(/\D+/g, ''); }
+function isValidCPF_(cpf) {
+  cpf = onlyDigits_(cpf); if (!cpf || cpf.length !== 11) return false;
+  if (/^(\d)\1{10}$/.test(cpf)) return false;
+  var soma = 0, resto;
+  for (var i = 1; i <= 9; i++) soma += parseInt(cpf.substring(i-1, i), 10) * (11 - i);
+  resto = (soma * 10) % 11; if (resto === 10 || resto === 11) resto = 0;
+  if (resto !== parseInt(cpf.substring(9, 10), 10)) return false;
+  soma = 0;
+  for (var j = 1; j <= 10; j++) soma += parseInt(cpf.substring(j-1, j), 10) * (12 - j);
+  resto = (soma * 10) % 11; if (resto === 10 || resto === 11) resto = 0;
+  if (resto !== parseInt(cpf.substring(10, 11), 10)) return false;
+  return true;
+}
+function getOrCreateSub_(root, name) {
+  try {
+    var it = root.getFoldersByName(name);
+    return it.hasNext() ? it.next() : root.createFolder(name);
+  } catch (e) {
+    console.error("Error in getOrCreateSub_ for " + name + ":", e);
+    return null;
+  }
+}
+function slugExiste_(slug) {
+  const ss = openSS_();
+  const shCad = ss.getSheetByName('cadastros'); if (!shCad) return false;
+  const last = shCad.getLastRow(); if (last < 2) return false;
+  const headers = shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(String);
+  const idxSite = headers.indexOf('siteSlug'); if (idxSite === -1) return false;
+  const vals = shCad.getRange(2, idxSite+1, last-1, 1).getValues();
+  for (var i = 0; i < vals.length; i++) {
+    const s = String(vals[i][0] || '').trim().toUpperCase();
+    if (s === slug) return true;
+  }
+  return false;
+}
+function jsonOut_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON)
+    .setHeaders({
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
+}
+function ensureLogSheet_(ss) {
+  var sh = ss.getSheetByName("logs");
+  if (!sh) sh = ss.insertSheet("logs");
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(["timestamp","stage","contentType","isMultipart","hasPD","rawLen","type","event","keys","note","error"]);
+  }
+  return sh;
+}
+function log_(ss, stage, obj) {
+  try {
+    var sh = ensureLogSheet_(ss);
+    sh.appendRow([
+      new Date(),
+      stage || "",
+      String(obj && obj.contentType || ""),
+      String(obj && obj.isMultipart || ""),
+      String(obj && obj.hasPD || ""),
+      String(obj && obj.rawLen || ""),
+      String(obj && obj.type || ""),
+      String(obj && obj.event || ""),
+      String(obj && obj.keys || ""),
+      String(obj && obj.note || ""),
+      String(obj && obj.error || "")
+    ]);
+  } catch (_) {}
+}
+function safeJson_(o) {
+  try { return JSON.stringify(o || {}); } catch (e) { return '{"ok":false,"error":"json_stringify"}'; }
+}
+
+function clientBilling_(ss, data){
+  var email = String(data.email || '').trim().toLowerCase();
+  if (!email) return jsonOut_({ ok:false, error:'missing_email' });
+
+  var sh = ensureUsuariosSheet_(ss);
+  var idx = findUserRowByEmail_(sh, email);
+  if (idx === -1) return jsonOut_({ ok:false, error:'not_found' });
+  ensureBillingColumns_(sh);
+  var row = idx + 2;
+  var map = headerIndexMap_(sh);
+
+  // plano (com fallback do cadastro)
+  var plan = String(sh.getRange(row, map.plan+1).getValue() || '');
+  if (!plan) {
+    var site = String(sh.getRange(row, map.siteSlug+1).getValue() || '').trim().toUpperCase();
+    var planFromCad = getPlanForUser_(ss, email, site);
+    if (planFromCad) { 
+      plan = planFromCad; 
+      sh.getRange(row, map.plan+1).setValue(plan); 
+    }
+  }
+
+  // lê valores existentes
+  var status   = String(sh.getRange(row, map.billing_status+1).getValue() || '') || '';
+  var next     = sh.getRange(row, map.billing_next+1).getValue();
+  var amount   = Number(sh.getRange(row, map.billing_amount+1).getValue() || 0) || 0;
+  var currency = String(sh.getRange(row, map.billing_currency+1).getValue() || '') || 'BRL';
+  var provider = String(sh.getRange(row, map.billing_provider+1).getValue() || '') || 'mercadopago';
+  var siteSlug = String(sh.getRange(row, map.siteSlug+1).getValue() || '').trim().toUpperCase();
+
+  /* ---------- FALLBACKS DE STATUS ---------- */
+  var statusLower = String(status).toLowerCase();
+  var isActive = isActiveStatus_(statusLower);
+
+  // 1) Se vazio ou inativo, tenta do cadastro
+  if (!isActive) {
+    var s = siteSlug ? getStatusForSite_(siteSlug) : { ok:false };
+    if (s && s.ok && s.status) {
+      statusLower = String(s.status).toLowerCase();
+      isActive = isActiveStatus_(statusLower);
+    }
+  }
+  // 2) Se ainda não, tenta ver se há aprovação recente no histórico por e-mail
+  if (!isActive) {
+    var lastApprovedByMail = getLastApprovedPaymentDateForEmail_(ss, email);
+    if (lastApprovedByMail) {
+      statusLower = 'approved';
+      isActive = true;
+      // também calcula next caso não exista
+      if (!next) {
+        var dNext = addDays_(clampToMidnight_(lastApprovedByMail), RENEWAL_INTERVAL_DAYS);
+        sh.getRange(row, map.billing_next+1).setValue(dNext);
+        next = dNext;
+      }
+    }
+  }
+
+  // Persistir status caso tenha mudado
+  if (statusLower && statusLower !== String(status).toLowerCase()) {
+    sh.getRange(row, map.billing_status+1).setValue(statusLower);
+  }
+
+  // next padrão se continuar vazio
+  if (!next) {
+    var d = new Date(Date.now() + 1000*60*60*24*30);
+    sh.getRange(row, map.billing_next+1).setValue(d);
+    next = d;
+  }
+
+  // amount padrão por plano
+  if (amount === 0) {
+    amount = String(plan).toLowerCase().indexOf('vip') !== -1 ? 99.9 : 39.9;
+    sh.getRange(row, map.billing_amount+1).setValue(amount);
+  }
+
+  // grava sempre currency/provider
+  sh.getRange(row, map.billing_currency+1).setValue(currency);
+  sh.getRange(row, map.billing_provider+1).setValue(provider);
+
+  return jsonOut_({
+    ok:true,
+    plan: (String(plan).toLowerCase().indexOf('vip')!==-1 ? 'vip':'essential'),
+    status: statusLower || 'pending',
+    provider,
+    next_renewal: next ? new Date(next).toISOString() : '',
+    amount, currency
+  });
+}
+
+/* ======= NOVOS HELPERS para o AdminDashboard (sites/status) ======= */
+function getSiteSlugs_() {
+  try {
+    const ss = openSS_();
+    const shCad = ss.getSheetByName("cadastros");
+    if (!shCad) return [];
+    
+    const data = shCad.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+    const idxSite = headers.indexOf("siteSlug");
+    
+    if (idxSite === -1) return [];
+    
+    return data.slice(1)
+      .map(row => String(row[idxSite] || "").trim())
+      .filter(slug => slug.length > 0);
+  } catch (e) {
+    console.error("getSiteSlugs_ error:", e);
+    return [];
+  }
+}
+
+/** Status de cobrança considerado "ativo" (helper único usado em todo o dash) */
+function isActiveStatus_(s) {
+  s = String(s || '').toLowerCase();
+  return s === 'approved' || s === 'authorized' || s === 'accredited' ||
+         s === 'recurring_charges' || s === 'active';
+}
+
+function getStatusForSite_(slug) {
+  try {
+    const ss = openSS_();
+    const shCad = ss.getSheetByName("cadastros");
+    if (!shCad) return { ok: false, error: "missing_sheet_cadastros" };
+    
+    const data = shCad.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+    const idxSite = headers.indexOf("siteSlug");
+    const idxEmail = headers.indexOf("email");
+    const idxManual = headers.indexOf("manual_block");
+    const idxActive = headers.indexOf("active");
+    const idxPreapproval = headers.indexOf("preapproval_id");
+    
+    if (idxSite === -1) return { ok: false, error: "missing_siteSlug_header" };
+    
+    const row = data.find(r => normalizeSlug_(String(r[idxSite] || "")) === slug);
+    if (!row) return { ok: false, error: "site_not_found" };
+    
+    const email = String(row[idxEmail] || "");
+    const manualBlock = String(row[idxManual] || "").toLowerCase() === "true";
+    const active = String(row[idxActive] || "").toLowerCase() === "true";
+    const preapprovalId = String(row[idxPreapproval] || "");
+    
+    return {
+      ok: true,
+      active: active,
+      manualBlock: manualBlock,
+      status: "active",
+      preapproval_id: preapprovalId,
+      email: email,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/** ======= POLÍTICA DE COBRANÇA ======= */
+const GRACE_DAYS = 3;                   // margem após a data da renovação
+const RENEWAL_INTERVAL_DAYS = 30;       // recorrência
+const AUTO_BLOCK_OVER_GRACE = true;     // se true, marca manual_block=TRUE ao cancelar
+
+function addDays_(date, days) {
+  var d = new Date(date.getTime());
+  d.setDate(d.getDate() + days);
+  return d;
+}
+function clampToMidnight_(d) {
+  var x = new Date(d);
+  x.setHours(0,0,0,0);
+  return x;
+}
+
+function ensureFeedbacksSheet_() {
+  var ss = openSS_();
+  var sh = ss.getSheetByName("feedbacks");
+  if (!sh) sh = ss.insertSheet("feedbacks");
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(["id","timestamp","siteSlug","name","rating","comment","email","phone","approved"]);
+  }
+  return sh;
+}
+
+/* Planilha "faturamento" com cabeçalho padrão (usada por recomputeBillingAll_) */
+function ensureFaturamentoSheet_() {
+  var ss = openSS_();
+  var sh = ss.getSheetByName('faturamento');
+  if (!sh) sh = ss.insertSheet('faturamento');
+  if (sh.getLastRow() === 0) {
+    sh.appendRow([
+      'preapproval_id','email','siteSlug','plano','status','amount','currency','provider',
+      'last_payment','next_renewal','overdue','days_overdue','updated_at'
+    ]);
+  }
+  return sh;
+}
+
+function recomputeBillingAll_() {
+  var ss = openSS_();
+  var shDados = ss.getSheetByName('dados');
+  var shCad   = ss.getSheetByName('cadastros');
+  var shUsers = ss.getSheetByName('usuarios');
+  var shFat   = ensureFaturamentoSheet_();
+
+  // --- agrega por preapproval_id ---
+  var map = {}; // pre -> { email, siteSlug, plano, status, amount, currency, provider, last_payment }
+
+  // cadastros
+  if (shCad) {
+    var cad = shCad.getDataRange().getValues();
+    if (cad.length >= 2) {
+      var hc = cad[0].map(String), rows = cad.slice(1);
+      var iEmail = hc.indexOf('email');
+      var iSite  = hc.indexOf('siteSlug');
+      var iPlan  = hc.indexOf('plan');
+      var iPre   = hc.indexOf('preapproval_id');
+      for (var i=0;i<rows.length;i++){
+        var r = rows[i];
+        var pre = iPre>=0 ? String(r[iPre]||'').trim() : '';
+        if (!pre) continue;
+        map[pre] = map[pre] || {};
+        if (iEmail>=0) map[pre].email = String(r[iEmail]||'').trim().toLowerCase();
+        if (iSite>=0)  map[pre].siteSlug = String(r[iSite]||'').trim().toUpperCase();
+        if (iPlan>=0)  map[pre].plano = String(r[iPlan]||'').trim();
+      }
+    }
+  }
+
+  // dados (webhooks)
+  if (shDados) {
+    var dd = shDados.getDataRange().getValues();
+    if (dd.length >= 2) {
+      var hd = dd[0].map(String), drows = dd.slice(1);
+      var iTs   = hd.indexOf('timestamp');
+      var iPre  = hd.indexOf('preapproval_id');
+      var iStat = hd.indexOf('status');
+      var iMail = hd.indexOf('payer_email');
+      var iAmt  = hd.indexOf('amount');
+      for (var j=0;j<drows.length;j++){
+        var r = drows[j];
+        var pre = iPre>=0 ? String(r[iPre]||'').trim() : '';
+        if (!pre) continue;
+        map[pre] = map[pre] || {};
+        var ts = iTs>=0 && r[iTs] ? new Date(r[iTs]) : null;
+
+        // status/amount/email (último visto)
+        if (iStat>=0) map[pre].status = String(r[iStat]||'').trim().toLowerCase();
+        if (iAmt>=0)  map[pre].amount = Number(r[iAmt]||0) || 0;
+        map[pre].currency = map[pre].currency || 'BRL';
+        map[pre].provider = 'mercadopago';
+        if (iMail>=0 && String(r[iMail]||'').trim()) map[pre].email = String(r[iMail]||'').trim().toLowerCase();
+
+        // última aprovação
+        if (ts && String(r[iStat]||'').toLowerCase() === 'approved') {
+          if (!map[pre].last_payment || ts.getTime() > map[pre].last_payment.getTime()) {
+            map[pre].last_payment = ts;
+          }
+        }
+      }
+    }
+  }
+
+  // fallback de site/plano pelos usuarios
+  if (shUsers) {
+    var uu = shUsers.getDataRange().getValues();
+    if (uu.length >= 2) {
+      var hu = uu[0].map(String), urows = uu.slice(1);
+      var iEmailU = hu.indexOf('email');
+      var iSiteU  = hu.indexOf('siteSlug');
+      var iPlanU  = hu.indexOf('plan');
+      var byEmail = {};
+      for (var u=0;u<urows.length;u++){
+        var ru = urows[u];
+        var em = iEmailU>=0 ? String(ru[iEmailU]||'').trim().toLowerCase() : '';
+        if (!em) continue;
+        byEmail[em] = {
+          siteSlug: iSiteU>=0 ? String(ru[iSiteU]||'').trim().toUpperCase() : '',
+          plano:    iPlanU>=0 ? String(ru[iPlanU]||'').trim() : ''
+        };
+      }
+      Object.keys(map).forEach(function(pre){
+        var email = map[pre].email || '';
+        if (email && byEmail[email]) {
+          map[pre].siteSlug = map[pre].siteSlug || byEmail[email].siteSlug || '';
+          map[pre].plano    = map[pre].plano    || byEmail[email].plano    || '';
+        }
+      });
+    }
+  }
+
+  // --- aplica política de graça / cancelamento ---
+  var now = clampToMidnight_(new Date());
+
+  // limpar e reescrever faturamento
+  shFat.clearContents();
+  shFat.appendRow([
+    'preapproval_id','email','siteSlug','plano','status','amount','currency','provider',
+    'last_payment','next_renewal','overdue','days_overdue','updated_at'
+  ]);
+
+  var cadHeaders = shCad ? shCad.getRange(1,1,1,shCad.getLastColumn()).getValues()[0].map(String) : [];
+  var idxSite = cadHeaders.indexOf('siteSlug');
+  var idxPre  = cadHeaders.indexOf('preapproval_id');
+  var idxMan  = cadHeaders.indexOf('manual_block');
+
+  var mapU = headerIndexMap_(shUsers || ensureUsuariosSheet_(ss));
+
+  var rowsOut = [];
+
+  Object.keys(map).forEach(function(pre){
+    var o = map[pre] || {};
+    var last = o.last_payment || null;
+    var next = last ? addDays_(clampToMidnight_(last), RENEWAL_INTERVAL_DAYS) : null;
+
+    var status = (o.status || '').toLowerCase(); // approved/authorized/…/paused/cancelled
+    var daysOverdue = (next && now > next) ? Math.floor((now - next) / (1000*60*60*24)) : 0;
+    var overdue = daysOverdue > 0;
+
+    var justCancelled = false;
+
+    // status anterior salvo em 'usuarios'
+    var wasStatus = "";
+    var wasActive = false;
+    if (shUsers) {
+      try {
+        var idxU = findUserRowByEmail_(shUsers, (o.email || "").toLowerCase());
+        if (idxU !== -1) {
+          var rowU = idxU + 2;
+          wasStatus = String(shUsers.getRange(rowU, mapU.billing_status + 1).getValue() || "");
+          wasActive = isActiveStatus_(wasStatus);
+        }
+      } catch (_) {}
+    }
+
+    // estourou a graça → cancela
+    if (overdue && daysOverdue > GRACE_DAYS && status !== 'cancelled' && status !== 'canceled' && status !== 'paused') {
+      status = 'cancelled';
+      justCancelled = true;
+    }
+
+    // reativação: antes não ativo e agora ativo
+    var nowActive = isActiveStatus_(status);
+    var justReactivated = (!wasActive && nowActive);
+
+    // hooks para desligar/ligar site
+    try {
+      if (justCancelled && o.siteSlug) notifySiteToggle_(o.siteSlug, false);
+      if (justReactivated && o.siteSlug) notifySiteToggle_(o.siteSlug, true);
+    } catch (_) {}
+
+    // persistir status atual em usuarios.billing_status
+    if (shUsers) {
+      try {
+        var idxPersist = findUserRowByEmail_(shUsers, (o.email || "").toLowerCase());
+        if (idxPersist !== -1) {
+          var rowPersist = idxPersist + 2;
+          shUsers.getRange(rowPersist, mapU.billing_status + 1).setValue(status || "");
+        }
+      } catch (_) {}
+    }
+
+    // bloquear site no cadastros quando cancelado
+    if (AUTO_BLOCK_OVER_GRACE && shCad && idxMan !== -1 && (status === 'cancelled' || status === 'canceled')) {
+      try {
+        var lastRow = shCad.getLastRow(); 
+        if (lastRow >= 2) {
+          var rng = shCad.getRange(2,1,lastRow-1,shCad.getLastColumn());
+          var all = rng.getValues();
+          for (var i=0;i<all.length;i++){
+            var r = all[i];
+            var preR = String(r[idxPre]||'').trim();
+            if (preR === pre) {
+              r[idxMan] = 'TRUE';
+              all[i] = r;
+              break;
+            }
+          }
+          rng.setValues(all);
+        }
+      } catch(_) {}
+    }
+
+    // e-mails
+    try {
+      if (overdue && daysOverdue === 1) {
+        sendBillingEmailWarn_(o.email, o.siteSlug, next, daysOverdue);
+      }
+      if (justCancelled) {
+        sendBillingEmailCancelled_(o.email, o.siteSlug, next, daysOverdue);
+      }
+    } catch(_) {}
+
+    rowsOut.push([
+      pre,
+      o.email || '',
+      o.siteSlug || '',
+      o.plano || '',
+      status || '',
+      o.amount || 0,
+      o.currency || 'BRL',
+      o.provider || 'mercadopago',
+      last ? Utilities.formatDate(last, Session.getScriptTimeZone(), "yyyy-MM-dd") : '',
+      next ? Utilities.formatDate(next, Session.getScriptTimeZone(), "yyyy-MM-dd") : '',
+      overdue ? 'TRUE' : '',
+      daysOverdue || 0,
+      Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ssXXX")
+    ]);
+  });
+
+  if (rowsOut.length) shFat.getRange(2,1,rowsOut.length,rowsOut[0].length).setValues(rowsOut);
+  return { ok:true, rows: rowsOut.length };
+}
+
+function recomputeBillingOne_(preapprovalId) {
+  // simples e robusto: recalcula tudo
+  recomputeBillingAll_();
+}
+
+function teamEmail_() {
+  var props = PropertiesService.getScriptProperties();
+  return props.getProperty('TEAM_EMAIL') || 'matheusmartinss@icloud.com';
+}
+
+function dashUrl_() {
+  // Pode sobrepor via Script Properties (DASH_URL)
+  var props = PropertiesService.getScriptProperties();
+  return props.getProperty('DASH_URL') || 'https://eleveaagencia.netlify.app/dashboard';
+}
+
+/** Boas-vindas com senha temporária (usuário novo) */
+function sendWelcomeEmailWithPassword_(toEmail, site, tempPassword, dashUrl) {
+  if (!toEmail) return;
+  var subj = "[Elevea] Acesso ao seu painel";
+  var body =
+    "<p>Olá!</p>" +
+    "<p>Seu painel do site <b>"+(site||'(sem slug)')+"</b> está pronto.</p>" +
+    "<p><b>Endereço do painel:</b> <a href=\""+dashUrl+"\">"+dashUrl+"</a></p>" +
+    "<p><b>Login:</b> "+toEmail+"<br>" +
+    "<b>Senha provisória:</b> "+tempPassword+"</p>" +
+    "<p>Recomendamos alterar a senha no primeiro acesso.</p>";
+  MailApp.sendEmail({ to: toEmail, subject: subj, htmlBody: body, cc: teamEmail_() });
+}
+
+/** Boas-vindas com link de redefinição (usuário já existia) */
+function sendWelcomeEmailWithReset_(toEmail, site, dashUrl, token) {
+  if (!toEmail) return;
+  var resetLink = dashUrl.replace(/\/+$/,"") + "/reset?email="+encodeURIComponent(toEmail)+"&token="+encodeURIComponent(token||'');
+  var subj = "[Elevea] Acesso ao seu painel";
+  var body =
+    "<p>Olá!</p>" +
+    "<p>Seu painel do site <b>"+(site||'(sem slug)')+"</b> está pronto.</p>" +
+    "<p><b>Endereço do painel:</b> <a href=\""+dashUrl+"\">"+dashUrl+"</a></p>" +
+    "<p>Para definir sua senha, clique: <a href=\""+resetLink+"\">Criar/Redefinir senha</a>.</p>";
+  MailApp.sendEmail({ to: toEmail, subject: subj, htmlBody: body, cc: teamEmail_() });
+}
+
+function sendBillingEmailWarn_(toEmail, siteSlug, nextDate, daysOverdue) {
+  if (!toEmail) return;
+  var subj = "[Elevea] Renovação pendente do seu site";
+  var body =
+    "<p>Olá!</p>" +
+    "<p>Detectamos que a renovação da sua assinatura do site <b>"+(siteSlug||"(sem slug)")+"</b> está pendente.</p>" +
+    "<p>Data prevista: <b>"+(nextDate ? Utilities.formatDate(nextDate, Session.getScriptTimeZone(), "dd/MM/yyyy") : "(não definida)")+"</b>.</p>" +
+    "<p>Você tem uma margem de <b>"+GRACE_DAYS+" dias</b>. Após isso, a assinatura é cancelada automaticamente.</p>" +
+    "<p>Se precisar de ajuda, responda este e-mail.</p>";
+  MailApp.sendEmail({ to: toEmail, cc: teamEmail_(), subject: subj, htmlBody: body });
+}
+
+function sendBillingEmailCancelled_(toEmail, siteSlug, nextDate, daysOverdue) {
+  if (!toEmail) return;
+  var subj = "[Elevea] Assinatura cancelada por falta de renovação";
+  var body =
+    "<p>Olá!</p>" +
+    "<p>Sua assinatura do site <b>"+(siteSlug||"(sem slug)")+"</b> foi <b>cancelada</b> por não constarmos o pagamento após a margem de "+GRACE_DAYS+" dias.</p>" +
+    "<p>Data prevista da renovação: <b>"+(nextDate ? Utilities.formatDate(nextDate, Session.getScriptTimeZone(), "dd/MM/yyyy") : "(não definida)")+"</b>.</p>" +
+    "<p>Podemos reativar rapidamente assim que regularizar. Fale conosco respondendo este e-mail.</p>";
+  MailApp.sendEmail({ to: toEmail, cc: teamEmail_(), subject: subj, htmlBody: body });
+}
+
+/** ====== Wrappers públicos para agendamento ====== */
+function recomputeBillingAll() { return recomputeBillingAll_(); }
+function recomputeBillingOne() { return recomputeBillingOne_(''); }
+function sincronizarStatusDiario() { return recomputeBillingAll_(); }
+
+/** ================== ASSETS (GET) + UPLOAD BASE64 (POST) ================== */
+/** Gera URL “view” do Google Drive (boa pra <img src=...>) e abre sharing. */
+function ensureShareAndGetViewUrl_(file) {
+  try {
+    if (file && file.getId) {
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      return "https://drive.google.com/uc?export=view&id=" + file.getId();
+    }
+  } catch (e) {
+    console.error("Error in ensureShareAndGetViewUrl_:", e);
+  }
+  return "";
+}
+
+/** Extrai com segurança o ID de pasta do Drive a partir da URL */
+function extractDriveFolderId_(folderUrl) {
+  if (!folderUrl) return null;
+  var url = String(folderUrl).trim();
+  if (!url) return null;
+  
+  // Try to extract from /folders/ID pattern
+  var m = url.match(/\/folders\/([^/?#]+)/);
+  if (m && m[1]) return m[1];
+  
+  // Fallback: try to extract ID from end of URL
+  var parts = url.split("/");
+  var lastPart = parts[parts.length - 1];
+  if (lastPart) {
+    var id = lastPart.split("?")[0].split("#")[0];
+    if (id && id.length > 10) return id; // Basic validation
+  }
+  
+  return null;
+}
+
+/**
+ * GET /exec?type=assets&site=SLUG
+ * Retorna { ok:true, items:[{ key, url }] }
+ * - Scaneia a pasta do cliente (SITE-<SLUG>) e subpastas "logo" e "fotos"
+ * - Cria aliases úteis: hero/banner/principal -> media_1; gallery_1..5 -> media_2..6...
+ */
+function handleAssetsList_(site) {
+  site = normalizeSlug_(String(site || ""));
+  if (!site) return jsonOut_({ ok:false, error: "missing_site" });
+
+  // Garante/obtém a pasta do cliente
+  var folderUrl = ensureClientFolderUrl_(site);
+  if (!folderUrl) return jsonOut_({ ok:false, error: "no_drive_folder" });
+
+  try {
+    var folderId = extractDriveFolderId_(folderUrl);
+    var root = DriveApp.getFolderById(folderId);
+
+    // Subpastas usuais
+    function findSub(name) {
+      var it = root.getFoldersByName(name);
+      return it.hasNext() ? it.next() : null;
+    }
+    var logo  = findSub("logo");
+    var fotos = findSub("fotos");
+
+    // Helpers
+    function keyNorm_(name) {
+      var base = String(name || "").replace(/\.[^.]+$/, "");
+      base = base.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+      base = base.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_-]/g, '');
+      return base;
+    }
+    function aliasKeysFor_(k) {
+      var out = [k];
+      if (["hero","banner","principal"].includes(k)) out.push("media_1");
+      if (["destaque_1","gallery_1"].includes(k))    out.push("media_2");
+      if (["destaque_2","gallery_2"].includes(k))    out.push("media_3");
+      if (["gallery_3"].includes(k))                  out.push("media_4");
+      if (["gallery_4"].includes(k))                  out.push("media_5");
+      if (["gallery_5"].includes(k))                  out.push("media_6");
+      return Array.from(new Set(out));
+    }
+
+    var items = [];
+    function pushFilesFromFolder_(sub) {
+      if (!sub) return;
+      var it = sub.getFiles();
+      while (it.hasNext()) {
+        var f = it.next();
+        var k = keyNorm_(f.getName() || "");
+        var url = ensureShareAndGetViewUrl_(f); // já abre permissão pública
+        // item com a key "pura"
+        items.push({ key: k, url: url });
+        // e também com as chaves-alias (media_1..6 quando aplicável)
+        aliasKeysFor_(k).forEach(function(a){
+          if (a !== k) items.push({ key: a, url: url });
+        });
+      }
+    }
+
+    // Coleta
+    pushFilesFromFolder_(logo);
+    pushFilesFromFolder_(fotos);
+
+    return jsonOut_({ ok: true, items: items });
+  } catch (e) {
+    return jsonOut_({ ok:false, error: String(e) });
+  }
+}
+
+/**
+ * POST /exec?type=upload_base64
+ * Body JSON:
+ * {
+ *   type: "upload_base64",
+ *   email, siteSlug,
+ *   logo:  { name, mime, b64 },           // opcional
+ *   fotos: [{ name, mime, b64 }, ...],    // opcional
+ *   logoLink, fotosLink                    // opcionais (serão salvos num txt)
+ * }
+ */
+function handleUploadBase64_(ss, data) {
+  try {
+    var email = String(data.email || "").trim().toLowerCase();
+    var site  = normalizeSlug_(String(data.siteSlug || ""));
+    if (!email || !site) return jsonOut_({ ok:false, error: "missing_email_or_siteSlug" });
+
+    var folderUrl = ensureClientFolderUrl_(site);
+    if (!folderUrl) return jsonOut_({ ok:false, error: "no_drive_folder" });
+
+    var folderId = extractDriveFolderId_(folderUrl);
+    if (!folderId) return jsonOut_({ ok:false, error: "invalid_folder_id" });
+    
+    var root = DriveApp.getFolderById(folderId);
+    var logoFolder  = getOrCreateSub_(root, "logo");
+    var fotosFolder = getOrCreateSub_(root, "fotos");
+    var saved = [];
+
+    // Salva links informativos (se houver)
+    var logoLink  = String(data.logoLink  || "");
+    var fotosLink = String(data.fotosLink || "");
+    if (logoLink || fotosLink) {
+      var lines = [];
+      if (logoLink)  lines.push("logoLink: " + logoLink);
+      if (fotosLink) lines.push("fotosLink: " + fotosLink);
+      try {
+        var linkFile = root.createFile("links.txt", lines.join("\n"));
+        saved.push(linkFile.getName());
+      } catch (linkErr) {
+        console.error("Link file creation error:", linkErr);
+      }
+    }
+
+    // Converte base64 -> Blob e salva
+    function saveBase64_(targetFolder, obj) {
+      if (!obj || !obj.b64) return;
+      try {
+        var name = String(obj.name || ("upload-" + new Date().getTime()));
+        var mime = String(obj.mime || "application/octet-stream");
+        var blob = Utilities.newBlob(Utilities.base64Decode(obj.b64), mime, name);
+        var file = targetFolder.createFile(blob);
+        try { file.setDescription("Upload (base64) Elevea - " + site); } catch(_e){}
+        saved.push(file.getName());
+        ensureShareAndGetViewUrl_(file); // já abre permissão + gera URL pública
+      } catch (saveErr) {
+        console.error("Save base64 error:", saveErr);
+        saved.push("erro: " + String(saveErr));
+      }
+    }
+
+    if (data.logo) {
+      saveBase64_(logoFolder, data.logo);
+    }
+    if (Array.isArray(data.fotos) && data.fotos.length) {
+      for (var i = 0; i < data.fotos.length; i++) {
+        saveBase64_(fotosFolder, data.fotos[i]);
+      }
+    }
+
+    // Log leve
+    try {
+      var sh = ensureOnboardingSheet_(ss);
+      sh.appendRow([
+        new Date(), email, site, "",
+        "(upload_base64)", "(upload_base64)", "", "", "", "", "",
+        root.getUrl(), "FILES:" + (saved.length ? saved.join(", ") : "(nenhum)")
+      ]);
+    } catch (_e) {}
+
+    return jsonOut_({ ok:true, driveFolderUrl: root.getUrl(), saved: saved });
+  } catch (err) {
+    return jsonOut_({ ok:false, error:String(err) });
+  }
+}
+
+/**
+ * Lista arquivos públicos de uma pasta no Drive do cliente
+ * Pasta: SITE-<SLUG>
+ */
+
+function createLead_(ss, data) {
+  try {
+    var site = normalizeSlug_(String(data.site || data.siteSlug || ""));
+    if (!site) return jsonOut_({ ok:false, error:"missing_site" });
+
+    var name   = String(data.name || "");
+    var email  = String(data.email || "").trim().toLowerCase();
+    var phone  = String(data.phone || "");
+    var source = String(data.source || "site");
+
+    var sh = ensureLeadsSheet_();
+    sh.appendRow([ new Date(), site, name, email, phone, source ]);
+
+    return jsonOut_({ ok:true });
+  } catch (e) {
+    return jsonOut_({ ok:false, error:String(e) });
+  }
+}
+
+function createFeedback_(ss, data) {
+  try {
+    var site = normalizeSlug_(String(data.site || data.siteSlug || ""));
+    if (!site) return jsonOut_({ ok:false, error:"missing_site" });
+
+    var name    = String(data.name || "");
+    var rating  = Math.max(1, Math.min(5, parseInt(String(data.rating || "0"), 10) || 0));
+    var comment = String(data.comment || "");
+    var email   = String(data.email || "").trim().toLowerCase(); // opcional (não publicar)
+    var phone   = String(data.phone || "");                      // opcional (não publicar)
+
+    var sh = ensureFeedbacksSheet_();
+    var id = Utilities.getUuid().replace(/-/g, "");
+    sh.appendRow([ id, new Date(), site, name, rating, comment, email, phone, "" ]); // approved vazio = pendente
+
+    return jsonOut_({ ok:true, id });
+  } catch (e) {
+    return jsonOut_({ ok:false, error:String(e) });
+  }
+}
+
+/** ============ Helpers de ativação de site (Netlify Build Hook) via PLANILHA ============ */
+/** A aba "sites_hooks" guarda o mapeamento: siteSlug -> build_hook_url. */
+
+function ensureSitesHooksSheet_() {
+  var ss = openSS_();
+  var sh = ss.getSheetByName('sites_hooks');
+  if (!sh) sh = ss.insertSheet('sites_hooks');
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(['siteSlug','build_hook_url','notes','updated_at']);
+  }
+  return sh;
+}
+
+function readSiteBuildHook_(slug) {
+  slug = normalizeSlug_(slug);
+  if (!slug) return '';
+  var sh = ensureSitesHooksSheet_();
+  var vals = sh.getDataRange().getValues();
+  if (vals.length < 2) return '';
+  var head = vals[0].map(String);
+  var iSlug = head.indexOf('siteSlug');
+  var iUrl  = head.indexOf('build_hook_url');
+  for (var i = 1; i < vals.length; i++) {
+    var r = vals[i];
+    if (normalizeSlug_(String(r[iSlug] || '')) === slug) {
+      return String(r[iUrl] || '').trim();
+    }
+  }
+  return '';
+}
+
+/** Upsert opcional (útil pra atualizar via automação/admin) */
+function upsertSiteBuildHook_(slug, url) {
+  slug = normalizeSlug_(slug);
+  var sh = ensureSitesHooksSheet_();
+  var vals = sh.getDataRange().getValues();
+  var head = vals[0].map(String);
+  var iSlug = head.indexOf('siteSlug');
+  var iUrl  = head.indexOf('build_hook_url');
+  var iUpd  = head.indexOf('updated_at');
+
+  // Atualiza se já existir
+  for (var i = 1; i < vals.length; i++) {
+    if (normalizeSlug_(String(vals[i][iSlug] || '')) === slug) {
+      sh.getRange(i + 1, iUrl + 1).setValue(url);
+      if (iUpd >= 0) sh.getRange(i + 1, iUpd + 1).setValue(new Date());
+      return { ok: true, updated: true };
+    }
+  }
+  // Ou cria
+  sh.appendRow([slug, url, '', new Date()]);
+  return { ok: true, created: true };
+}
+
+/** Dispara o Build Hook do cliente informando { siteSlug, active } */
+function notifySiteToggle_(slug, active) {
+  try {
+    slug = normalizeSlug_(slug);
+    var hook = readSiteBuildHook_(slug);
+    if (!hook) return { ok: false, error: 'no_hook_for_slug' };
+
+    var resp = UrlFetchApp.fetch(hook, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ siteSlug: slug, active: !!active }),
+      muteHttpExceptions: true,
+    });
+    return { ok: true, status: resp.getResponseCode(), text: resp.getContentText() };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/* (NÃO redefinimos isActiveStatus_ aqui para evitar duplicidade; use a versão global já definida no projeto) */
+
+/** ====================== SETTINGS / LEADS / FEEDBACKS / TRAFFIC ====================== **/
+
+// ---------- SETTINGS ----------
+// usa uma aba separada para KV
+function ensureSettingsKVSheet_() {
+  var ss = openSS_();
+  var sh = ss.getSheetByName("settings_kv");
+  if (!sh) sh = ss.insertSheet("settings_kv");
+  if (sh.getLastRow() === 0) sh.appendRow(["siteSlug","updated_at","settings_json"]);
+  return sh;
+}
+
+// GET get_settings => usa settings_kv
+function getClientSettings_(site) {
+  try {
+    site = normalizeSlug_(site);
+    if (!site) return { ok:false, error:"missing_site" };
+    var sh = ensureSettingsKVSheet_();
+    var last = sh.getLastRow();
+    if (last < 2) return { ok:true, siteSlug: site, settings: {} };
+    var vals = sh.getRange(2,1,last-1,3).getValues();
+    for (var i = vals.length - 1; i >= 0; i--) {
+      var r = vals[i];
+      if (String(r[0]||"").trim().toUpperCase() === site) {
+        var json = String(r[2] || "{}");
+        var obj = {}; try { obj = JSON.parse(json); } catch(_){}
+        // remove vip_pin da resposta
+        if (obj && typeof obj.security==='object' && obj.security && obj.security.vip_pin) {
+          obj = JSON.parse(JSON.stringify(obj));
+          delete obj.security.vip_pin;
+          if (Object.keys(obj.security).length === 0) delete obj.security;
+        }
+        return { ok:true, siteSlug: site, settings: obj };
+      }
+    }
+    return { ok:true, siteSlug: site, settings: {} };
+  } catch (e) {
+    return { ok:false, error:String(e) };
+  }
+}
+
+// POST save_settings => escreve em settings_kv
+function saveClientSettings_(ss, data) {
+  try {
+    var site = normalizeSlug_(String(data.site || ""));
+    if (!site) return jsonOut_({ ok:false, error: "missing_site" });
+
+    var settings = data.settings && typeof data.settings === "object" ? data.settings : {};
+    var pin = String(data.pin || data.vipPin || "");
+
+    // === Verificação do PIN salvo ===
+    var shKV = ensureSettingsKVSheet_();
+    var last = shKV.getLastRow();
+    var savedPin = "";
+    if (last >= 2) {
+      var vals = shKV.getRange(2, 1, last - 1, 3).getValues();
+      for (var i = vals.length - 1; i >= 0; i--) {
+        if (String(vals[i][0] || "").trim().toUpperCase() === site) {
+          try {
+            var obj = JSON.parse(String(vals[i][2] || "{}"));
+            savedPin = String((obj.security && obj.security.vip_pin) || "");
+          } catch (_) {}
+          break;
+        }
+      }
+    }
+
+    if (savedPin && (!pin || pin !== savedPin)) {
+      return jsonOut_({ ok: false, error: "unauthorized" });
+    }
+
+    // === Grava nova linha no settings_kv ===
+    shKV.appendRow([site, new Date(), JSON.stringify(settings)]);
+
+    return jsonOut_({ ok: true, siteSlug: site });
+  } catch (e) {
+    return jsonOut_({ ok: false, error: String(e) });
+  }
+}
+
+/** ---------- SESSIONS (defs + data) em settings_kv ---------- */
+function mergeSettingsKV_(site, partialObj) {
+  site = normalizeSlug_(site);
+  var sh = ensureSettingsKVSheet_();
+  var last = sh.getLastRow();
+
+  // leitura do último settings existente
+  var current = {};
+  if (last >= 2) {
+    var vals = sh.getRange(2,1,last-1,3).getValues();
+    for (var i = vals.length - 1; i >= 0; i--) {
+      if (String(vals[i][0]||"").trim().toUpperCase() === site) {
+        try { current = JSON.parse(String(vals[i][2]||"{}")); } catch(_){}
+        break;
+      }
+    }
+  }
+  // merge raso (por segurança, de forma pura)
+  function deepMerge(a,b){
+    if (!a || typeof a!=='object') a={};
+    if (!b || typeof b!=='object') return a;
+    var out = JSON.parse(JSON.stringify(a));
+    Object.keys(b).forEach(function(k){
+      if (b[k] && typeof b[k]==='object' && !Array.isArray(b[k])) {
+        out[k] = deepMerge(out[k]||{}, b[k]);
+      } else {
+        out[k] = b[k];
+      }
+    });
+    return out;
+  }
+  var next = deepMerge(current, partialObj);
+  sh.appendRow([site, new Date(), JSON.stringify(next)]);
+  return next;
+}
+
+// lê última linha da aba "settings" (onboarding normalizado) para um site
+function readLatestSettingsRow_(site) {
+  site = normalizeSlug_(site);
+  var ss = openSS_();
+  var sh = ss.getSheetByName("settings");
+  if (!sh) return null;
+  var last = sh.getLastRow(); if (last < 2) return null;
+  var h = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  var iSite = h.indexOf("siteSlug");
+  var rIdx = -1;
+  for (var r = last; r >= 2; r--) {
+    var s = String(sh.getRange(r, iSite+1).getValue() || '').trim().toUpperCase();
+    if (s === site) { rIdx = r; break; }
+  }
+  if (rIdx === -1) return null;
+
+  function G(colName) {
+    var i = h.indexOf(colName);
+    return i === -1 ? "" : String(sh.getRange(rIdx, i+1).getValue() || "");
+  }
+  // campos que precisamos
+  var empresa = G("empresa");
+  var historia = G("historia");
+  var produtos = G("produtos");
+  var fundacao = G("fundacao");
+  var email = G("email");
+  var whatsapp = G("whatsapp");
+  var endereco = G("endereco"); // pode vir como [object Object] / JSON
+  var palette_id = G("palette_id");
+  var colors_json = G("colors_json");
+  var template_id = G("template_id");
+  var logo_url = G("logo_url");
+  var fotos_json = G("fotos_urls_json");
+  var parsedEnd = {};
+  try { parsedEnd = JSON.parse(endereco); } catch(_) {}
+  var colors = [];
+  try { colors = JSON.parse(colors_json); } catch(_) {}
+  var fotos = [];
+  try { fotos = JSON.parse(fotos_json); } catch(_) {}
+
+  return {
+    empresa, historia, produtos, fundacao, email, whatsapp,
+    endereco: parsedEnd, palette_id, colors, template_id,
+    logo_url, fotos
+  };
+}
+
+// gera data inicial (por ID) com base nas respostas do onboarding
+function sectionsBootstrapFromOnboarding_(ss, site) {
+  site = normalizeSlug_(site);
+
+  // 1) buscar defs já gravadas
+  var shKV = ensureSettingsKVSheet_();
+  var last = shKV.getLastRow(); if (last < 2) return { error: "no_kv" };
+  var defs = [];
+  var current = {};
+  var vals = shKV.getRange(2,1,last-1,3).getValues();
+  for (var i = vals.length-1; i>=0; i--) {
+    if (String(vals[i][0]||"").trim().toUpperCase() === site) {
+      try { current = JSON.parse(String(vals[i][2]||"{}")); } catch(_){}
+      break;
+    }
+  }
+  defs = (current && current.sections && Array.isArray(current.sections.defs))
+    ? current.sections.defs : [];
+
+  if (!defs.length) return { error: "no_defs" };
+
+  // 2) ler onboarding normalizado
+  var o = readLatestSettingsRow_(site) || {};
+  // 3) montar "sections.data" por ID
+  var data = {};
+
+  // helpers
+  function or(v,a){ return (v!==undefined && v!==null && String(v).trim()!=="") ? v : a; }
+  function fullAddress(e){
+    if (!e || typeof e!=='object') return "";
+    var p = [e.logradouro, e.bairro, e.cidade, e.uf].filter(Boolean);
+    return p.join(", ");
+  }
+  function gmapsLink(e){
+    var q = encodeURIComponent(fullAddress(e) || (o.empresa||""));
+    return "https://www.google.com/maps/search/?api=1&query="+q;
+  }
+
+  defs.forEach(function(sec){
+    var id = String(sec.id||"").trim();
+    if (!id) return;
+
+    // valores default por seção conhecida; demais ficam vazias
+    if (id === "header") {
+      data[id] = { fields:{ brand: or(o.empresa,""), nav_links:"" }, slots:{} };
+    }
+    if (id === "hero") {
+      data[id] = {
+        fields:{
+          title: or(o.empresa, "Bem-vindo!"),
+          subtitle: or(o.produtos, o.historia || ""),
+          cta_whatsapp: o.whatsapp ? ("https://wa.me/"+o.whatsapp.replace(/\D+/g,'')) : ""
+        },
+        slots: { hero_img: or(o.logo_url, "") }
+      };
+    }
+    if (id === "sobre") {
+      data[id] = { fields:{ about: or(o.historia, "") }, slots:{} };
+    }
+    if (id === "servicos" || id === "produtos") {
+      data[id] = {
+        fields:{ list: or(o.produtos, "") },
+        slots:{}
+      };
+    }
+    if (id === "destaques") {
+      data[id] = { fields:{ bullets:"" }, slots:{} };
+    }
+    if (id === "depoimentos") {
+      data[id] = { fields:{ }, slots:{} }; // VIP pode moderar via feedbacks
+    }
+    if (id === "contato") {
+      data[id] = {
+        fields:{
+          email: or(o.email,""),
+          whatsapp: or(o.whatsapp,""),
+          address: fullAddress(o.endereco),
+          maps_url: gmapsLink(o.endereco),
+          instagram: "",
+          facebook: "",
+          tiktok: ""
+        },
+        slots:{}
+      };
+    }
+    if (!data[id]) data[id] = { fields:{}, slots:{} }; // fallback para IDs custom
+  });
+
+  // 4) gravar no KV (merge)
+  mergeSettingsKV_(site, { sections: { data: data } });
+
+  return { bootstrapped: Object.keys(data).length };
+}
+
+/**
+ * sectionsUpsertDefs_(ss, data)
+ * POST body:
+ * {
+ *   type: "sections_upsert_defs",
+ *   site: "SLUG",
+ *   defs: [ { id, name, fields?, slots? }, ... ],
+ *   // auth: pode ser ADMIN_DASH_TOKEN OU o vip_pin salvo em settings_kv.security.vip_pin
+ *   adminToken?: string,
+ *   pin?: string
+ * }
+ *
+ * Regras:
+ * - NÃO cria nomes fixos.
+ * - Somente armazena o que veio em "defs".
+ * - Preserva "sections.data" (valores) já existentes.
+ */
+function sectionsUpsertDefs_(ss, data) {
+  try {
+    var site = normalizeSlug_(String(data.site || data.siteSlug || ""));
+    if (!site) return jsonOut_({ ok:false, error: "missing_site" });
+
+    var defs = data.defs;
+    if (!Array.isArray(defs) || defs.length === 0) {
+      return jsonOut_({ ok:false, error: "missing_or_empty_defs" });
+    }
+
+    // Sanitiza defs minimamente: exige id string não vazia
+    defs = defs
+      .map(function(d){
+        var id = String((d && d.id) || "").trim();
+        if (!id) return null;
+        var out = { id: id };
+        if (d.name !== undefined) out.name = String(d.name);
+        if (d.fields && typeof d.fields === "object") out.fields = d.fields;
+        if (d.slots  && typeof d.slots  === "object") out.slots  = d.slots;
+        return out;
+      })
+      .filter(Boolean);
+    if (!defs.length) return jsonOut_({ ok:false, error: "empty_defs_after_sanitize" });
+
+    // --- Auth: ADMIN ou PIN VIP do site
+    var props  = PropertiesService.getScriptProperties();
+    var ADMIN  = (props.getProperty('ADMIN_DASH_TOKEN') || props.getProperty('ADMIN_TOKEN') || '').trim();
+    var okAuth = false;
+
+    if (ADMIN && String(data.adminToken || "").trim() === ADMIN) okAuth = true;
+    if (!okAuth) {
+      var pin = String(data.pin || data.vipPin || "").trim();
+      var savedPin = getVipPinForSite_(site);
+      if (savedPin && pin && pin === savedPin) okAuth = true;
+    }
+    if (!okAuth) return jsonOut_({ ok:false, error: "unauthorized" });
+
+    // --- Lê settings atuais
+    var sh = ensureSettingsKVSheet_();
+    var last = sh.getLastRow();
+    var cur = {};
+    if (last >= 2) {
+      var vals = sh.getRange(2,1,last-1,3).getValues();
+      for (var i = vals.length - 1; i >= 0; i--) {
+        if (String(vals[i][0]||"").trim().toUpperCase() === site) {
+          try { cur = JSON.parse(String(vals[i][2] || "{}")); } catch(_) { cur = {}; }
+          break;
+        }
+      }
+    }
+
+    // --- Atualiza somente sections.defs (preserva sections.data)
+    cur = cur || {};
+    cur.sections = cur.sections || {};
+    var dataOld = cur.sections.data || {};
+    cur.sections.defs = defs;   // substitui completamente o catálogo de sessões
+    cur.sections.data = dataOld; // preserva os valores já digitados
+
+    sh.appendRow([ site, new Date(), JSON.stringify(cur) ]);
+    return jsonOut_({ ok:true, siteSlug: site, defs_count: defs.length });
+  } catch (e) {
+    return jsonOut_({ ok:false, error:String(e) });
+  }
+}
+
+// ---------- LEADS ----------
+function ensureLeadsSheet_() {
+  var ss = openSS_();
+  var sh = ss.getSheetByName("leads");
+  if (!sh) sh = ss.insertSheet("leads");
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(["timestamp","siteSlug","name","email","phone","source"]);
+  }
+  return sh;
+}
+
+// Listagem paginada: retorna { ok:true, page, pageSize, total, items:[...] }
+function listLeads_(site, page, pageSize) {
+  try {
+    site = normalizeSlug_(site);
+    page = Math.max(1, parseInt(page, 10) || 1);
+    pageSize = Math.max(1, Math.min(200, parseInt(pageSize, 10) || 20));
+
+    var sh = ensureLeadsSheet_();
+    var last = sh.getLastRow(); 
+    if (last < 2) return { ok:true, page:1, pageSize:pageSize, total:0, items:[] };
+
+    var vals = sh.getRange(2,1,last-1,6).getValues().filter(function(r){
+      return String(r[1]||"").trim().toUpperCase() === site;
+    });
+
+    var total = vals.length;
+    var start = Math.min((page-1) * pageSize, Math.max(0, total - 1));
+    var slice = vals.slice(start, start + pageSize).map(function(r){
+      return {
+        ts: r[0] ? new Date(r[0]).toISOString() : "",
+        name: String(r[2]||""),
+        email: String(r[3]||""),
+        phone: String(r[4]||""),
+        source: String(r[5]||""),
+      };
+    });
+
+    return { ok:true, page:page, pageSize:pageSize, total: total, items: slice };
+  } catch (e) { 
+    return { ok:false, error:String(e) }; 
+  }
+}
+
+function getVipPinForSite_(site) {
+  site = normalizeSlug_(site);
+  var shKV = ensureSettingsKVSheet_();
+  var last = shKV.getLastRow();
+  if (last < 2) return "";
+  var vals = shKV.getRange(2,1,last-1,3).getValues();
+  for (var i = vals.length - 1; i >= 0; i--) {
+    if (String(vals[i][0]||"").trim().toUpperCase() === site) {
+      try {
+        var obj = JSON.parse(String(vals[i][2] || "{}"));
+        return String((obj.security && obj.security.vip_pin) || "");
+      } catch(_) { return ""; }
+    }
+  }
+  return "";
+}
+
+function feedbackSetApproval_(ss, data) {
+  var site = normalizeSlug_(String(data.site || data.siteSlug || ""));
+  var id   = String(data.id || "");
+  var approved = String(data.approved).toLowerCase() === "true";
+  if (!site || !id) return jsonOut_({ ok:false, error:"missing_params" });
+
+  // exige PIN (igual ao salvo em settings_kv.security.vip_pin)
+  var pin = String(data.pin || data.vipPin || "").trim();
+  var saved = getVipPinForSite_(site);
+  if (saved && pin !== saved) return jsonOut_({ ok:false, error:"unauthorized" });
+
+  var sh = ensureFeedbacksSheet_();
+  var last = sh.getLastRow(); if (last < 2) return jsonOut_({ ok:false, error:"empty" });
+
+  var vals = sh.getRange(2,1,last-1,9).getValues();
+  for (var i=0;i<vals.length;i++){
+    if (String(vals[i][0]||"") === id && String(vals[i][2]||"").trim().toUpperCase() === site) {
+      sh.getRange(i+2, 9).setValue(approved ? "TRUE" : "");
+      return jsonOut_({ ok:true });
+    }
+  }
+  return jsonOut_({ ok:false, error:"not_found" });
+}
+
+// ---------- FEEDBACKS ----------
+// Listagem paginada: { ok:true, page, pageSize, total, items:[...] }
+function listFeedbacks_(slug, page, pageSize, options) {
+  try {
+    const ss = openSS_();
+    const shFeedbacks = ss.getSheetByName("feedbacks");
+    if (!shFeedbacks) return { ok: false, error: "missing_sheet_feedbacks" };
+    
+    const data = shFeedbacks.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+    const idxSite = headers.indexOf("siteSlug");
+    const idxName = headers.indexOf("name");
+    const idxRating = headers.indexOf("rating");
+    const idxComment = headers.indexOf("comment");
+    const idxApproved = headers.indexOf("approved");
+    const idxTs = headers.indexOf("created_at");
+    
+    if (idxSite === -1) return { ok: false, error: "missing_siteSlug_header" };
+    
+    let siteFeedbacks = data.slice(1)
+      .filter(row => normalizeSlug_(String(row[idxSite] || "")) === slug);
+    
+    // Filtrar por público se necessário
+    if (options && options.public) {
+      siteFeedbacks = siteFeedbacks.filter(row => 
+        String(row[idxApproved] || "").toLowerCase() === "true"
+      );
+    }
+    
+    siteFeedbacks = siteFeedbacks.map(row => ({
+      name: String(row[idxName] || ""),
+      rating: parseInt(row[idxRating] || "0"),
+      comment: String(row[idxComment] || ""),
+      approved: String(row[idxApproved] || "").toLowerCase() === "true",
+      ts: String(row[idxTs] || new Date().toISOString())
+    }))
+    .sort((a, b) => new Date(b.ts) - new Date(a.ts));
+    
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize;
+    const items = siteFeedbacks.slice(start, end);
+    
+    return {
+      ok: true,
+      items: items,
+      total: siteFeedbacks.length,
+      page: page,
+      pageSize: pageSize
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+function listFeedbacksPublic_(site, page, pageSize) {
+  try {
+    site = normalizeSlug_(site);
+    page = Math.max(1, parseInt(page, 10) || 1);
+    pageSize = Math.max(1, Math.min(200, parseInt(pageSize, 10) || 20));
+
+    var sh = ensureFeedbacksSheet_();
+    var last = sh.getLastRow(); 
+    if (last < 2) return { ok:true, page:1, pageSize:pageSize, total:0, items:[] };
+
+    var vals = sh.getRange(2,1,last-1,9).getValues().filter(function(r){
+      return String(r[2]||"").trim().toUpperCase() === site && String(r[8]||"").toUpperCase() === "TRUE";
+    });
+
+    var total = vals.length;
+    var start = Math.min((page-1) * pageSize, Math.max(0, total - 1));
+    var slice = vals.slice(start, start + pageSize).map(function(r){
+      return {
+        id: String(r[0]||""),
+        ts: r[1] ? new Date(r[1]).toISOString() : "",
+        name: String(r[3]||""),
+        rating: Number(r[4]||0) || 0,
+        comment: String(r[5]||""),
+        approved: true
+      };
+    });
+
+    return { ok:true, page:page, pageSize:pageSize, total: total, items: slice };
+  } catch (e) { 
+    return { ok:false, error:String(e) }; 
+  }
+}
+
+/* ======= FEEDBACKS: endpoint unificado com auth por PIN/Admin ======= */
+/**
+ * GET/POST type: "list_feedbacks_secure"
+ * Body:
+ * { site, page, pageSize, pin?, adminToken? }
+ * - Se PIN válido (security.vip_pin em settings_kv) OU adminToken = ADMIN_DASH_TOKEN,
+ *   retorna TODOS os feedbacks do site.
+ * - Caso contrário, retorna somente os aprovados (equivalente ao público).
+ */
+function listFeedbacksSecure_(ss, data) {
+  try {
+    var site = normalizeSlug_(String(data.site || data.siteSlug || ''));
+    if (!site) return jsonOut_({ ok:false, error:'missing_site' });
+    var page = Math.max(1, parseInt(data.page,10) || 1);
+    var pageSize = Math.max(1, Math.min(200, parseInt(data.pageSize,10) || 20));
+
+    // auth
+    var props = PropertiesService.getScriptProperties();
+    var ADMIN = props.getProperty('ADMIN_DASH_TOKEN') || props.getProperty('ADMIN_TOKEN') || '';
+    var pinOk = false;
+    if (ADMIN && String(data.adminToken||'') === ADMIN) {
+      pinOk = true;
+    } else {
+      var pin = String(data.pin || data.vipPin || '');
+      var saved = getVipPinForSite_(site);
+      if (saved && pin && pin === saved) pinOk = true;
+    }
+
+    if (pinOk) {
+      var all = listFeedbacks_(site, page, pageSize);
+      return jsonOut_(all);
+    } else {
+      var pub = listFeedbacksPublic_(site, page, pageSize);
+      return jsonOut_(pub);
+    }
+  } catch (e) {
+    return jsonOut_({ ok:false, error:String(e) });
+  }
+}
+
+// ---------- TRAFFIC ----------
+function ensureTrafficSheet_() {
+  var ss = openSS_();
+  var sh = ss.getSheetByName("traffic");
+  if (!sh) sh = ss.insertSheet("traffic");
+  if (sh.getLastRow() === 0) {
+    sh.appendRow(["timestamp","siteSlug","path","ip","userAgent"]);
+  }
+  return sh;
+}
+
+// Body: { type:"record_hit", site:"SLUG", path:"/rota", ip?, userAgent? }
+function recordHit_(ss, data) {
+  try {
+    var site = normalizeSlug_(String(data.site || ""));
+    if (!site) return jsonOut_({ ok:false, error:"missing_site" });
+
+    var path = String(data.path || "/").trim();
+    if (path === "") path = "/";
+    if (path[0] !== "/") path = "/" + path;
+
+    var ip = String(data.ip || "");
+    var ua = String(data.userAgent || "");
+
+    var sh = ensureTrafficSheet_();
+    sh.appendRow([ new Date(), site, path, ip, ua ]);
+    return jsonOut_({ ok:true });
+  } catch (e) {
+    return jsonOut_({ ok:false, error:String(e) });
+  }
+}
+
+// GET: get_traffic(site, "7d"|"30d"|"all")
+function getTraffic_(slug, range) {
+  try {
+    const ss = openSS_();
+    const shTraffic = ss.getSheetByName("traffic");
+    if (!shTraffic) return { ok: false, error: "missing_sheet_traffic" };
+    
+    const data = shTraffic.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+    const idxSite = headers.indexOf("siteSlug");
+    const idxDay = headers.indexOf("day");
+    const idxHits = headers.indexOf("hits");
+    
+    if (idxSite === -1) return { ok: false, error: "missing_siteSlug_header" };
+    
+    const siteTraffic = data.slice(1)
+      .filter(row => normalizeSlug_(String(row[idxSite] || "")) === slug)
+      .map(row => ({
+        day: String(row[idxDay] || ""),
+        hits: parseInt(row[idxHits] || "0")
+      }))
+      .sort((a, b) => new Date(a.day) - new Date(b.day));
+    
+    return {
+      ok: true,
+      daily: siteTraffic,
+      total: siteTraffic.reduce((sum, item) => sum + item.hits, 0)
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/* ---- helper: última aprovação por e-mail (dados) ---- */
+function getLastApprovedPaymentDateForEmail_(ss, email) {
+  var sh = ss.getSheetByName("dados"); 
+  if (!sh) return null;
+  var last = sh.getLastRow(); 
+  if (last < 2) return null;
+
+  var h = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  var iTs   = h.indexOf("timestamp");
+  var iMail = h.indexOf("payer_email");
+  var iStat = h.indexOf("status");
+  if (iTs === -1 || iMail === -1 || iStat === -1) return null;
+
+  var rows = sh.getRange(2,1,last-1,sh.getLastColumn()).getValues();
+  var latest = null;
+  for (var r = rows.length - 1; r >= 0; r--) {
+    var e = String(rows[r][iMail] || "").trim().toLowerCase();
+    if (!e || e !== email) continue;
+    var st = String(rows[r][iStat] || "").toLowerCase();
+    if (!isActiveStatus_(st)) continue;
+    var ts = rows[r][iTs] ? new Date(rows[r][iTs]) : null;
+    if (ts && (!latest || ts.getTime() > latest.getTime())) latest = ts;
+  }
+  return latest;
+}
+
+// Usa a sheet "dados" para checar se há um evento aprovado para mpid/pre
+function hasApprovedEventForIds_(ss, mpid, pre) {
+  var sh = ss.getSheetByName("dados"); if (!sh) return false;
+  var last = sh.getLastRow(); if (last < 2) return false;
+
+  var h = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  var iMp   = h.indexOf("mp_id");
+  var iPre  = h.indexOf("preapproval_id");
+  var iStat = h.indexOf("status");
+  if (iMp === -1 || iPre === -1 || iStat === -1) return false;
+
+  var rows = sh.getRange(2,1,last-1,sh.getLastColumn()).getValues();
+  for (var r = rows.length - 1; r >= 0; r--) {
+    var row = rows[r];
+    var mOk = mpid && String(row[iMp]||"") === mpid;
+    var pOk = pre  && String(row[iPre]||"") === pre;
+    if (mOk || pOk) {
+      var st = String(row[iStat]||"").toLowerCase();
+      if (isActiveStatus_(st)) return true;
+    }
+  }
+  return false;
+}
+
+// Se quiser validar que o e-mail do onboarding bate com o e-mail do evento (quando vier id)
+function emailMatchesEvent_(ss, email, mpid, pre) {
+  var sh = ss.getSheetByName("dados"); if (!sh) return false;
+  var last = sh.getLastRow(); if (last < 2) return false;
+
+  var h = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  var iMp   = h.indexOf("mp_id");
+  var iPre  = h.indexOf("preapproval_id");
+  var iMail = h.indexOf("payer_email");
+  if (iMp === -1 || iPre === -1 || iMail === -1) return false;
+
+  var rows = sh.getRange(2,1,last-1,sh.getLastColumn()).getValues();
+  for (var r = rows.length - 1; r >= 0; r--) {
+    var row = rows[r];
+    var mOk = mpid && String(row[iMp]||"") === mpid;
+    var pOk = pre  && String(row[iPre]||"") === pre;
+    if (mOk || pOk) {
+      var e = String(row[iMail]||"").trim().toLowerCase();
+      return e && e === String(email||"").trim().toLowerCase();
+    }
+  }
+  return false;
+}
+
+// Fallback: há evento aprovado para este e-mail nos últimos N dias?
+function hasRecentApprovedEventForEmail_(ss, email, maxDays) {
+  var sh = ss.getSheetByName("dados"); if (!sh) return false;
+  var last = sh.getLastRow(); if (last < 2) return false;
+
+  var h = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  var iTs   = h.indexOf("timestamp");
+  var iMail = h.indexOf("payer_email");
+  var iStat = h.indexOf("status");
+  if (iTs === -1 || iMail === -1 || iStat === -1) return false;
+
+  var since = Date.now() - ((parseInt(maxDays,10)||0) * 24 * 60 * 60 * 1000);
+  var rows = sh.getRange(2,1,last-1,sh.getLastColumn()).getValues();
+  for (var r = rows.length - 1; r >= 0; r--) {
+    var row = rows[r];
+    var e = String(row[iMail]||"").trim().toLowerCase();
+    if (!e || e !== String(email||"").trim().toLowerCase()) continue;
+
+    var st = String(row[iStat]||"").toLowerCase();
+    if (!isActiveStatus_(st)) continue;
+
+    var ts = row[iTs] ? new Date(row[iTs]).getTime() : 0;
+    if (!since || (ts && ts >= since)) return true; // aprovado dentro da janela
+  }
+  return false;
+}
+
+// Só permite o e-mail se ele NÃO foi usado em outro site (ou se for o mesmo site)
+function emailAvailableForOnboarding_(ss, email, site) {
+  site = normalizeSlug_(site);
+  email = String(email||"").trim().toLowerCase();
+
+  // 1) settings (último registro de cada site) — coluna "email"
+  var shS = ss.getSheetByName("settings");
+  if (shS) {
+    var lastS = shS.getLastRow();
+    if (lastS >= 2) {
+      var hS = shS.getRange(1,1,1,shS.getLastColumn()).getValues()[0].map(String);
+      var iSite = hS.indexOf("siteSlug");
+      var iMail = hS.indexOf("email");
+      if (iSite !== -1 && iMail !== -1) {
+        var vals = shS.getRange(2,1,lastS-1,shS.getLastColumn()).getValues();
+        for (var r = 0; r < vals.length; r++) {
+          var s = String(vals[r][iSite]||"").trim().toUpperCase();
+          var e = String(vals[r][iMail]||"").trim().toLowerCase();
+          if (e && e === email && s && s !== site) return false;
+        }
+      }
+    }
+  }
+  // 2) (opcional) conferir "onboarding" se você usa essa aba como fonte de verdade de uso do e-mail
+  // Se quiser reforçar, pode repetir a lógica olhando a aba "onboarding".
+  return true;
+}
+
+// ========================================
+// SCRIPT PARA EXECUTAR NO GOOGLE APPS SCRIPT
+// ========================================
+// 1. Copie todo este código
+// 2. Cole no Google Apps Script
+// 3. Execute a função "criarContasMaster()"
+
+function criarContasMaster() {
+  try {
+    console.log('🚀 Iniciando criação das contas master...');
+    
+    // Obter o token admin
+    const props = PropertiesService.getScriptProperties();
+    const ADMIN_TOKEN = props.getProperty('ADMIN_DASH_TOKEN') || props.getProperty('ADMIN_TOKEN') || '';
+    
+    if (!ADMIN_TOKEN) {
+      console.error('❌ ADMIN_DASH_TOKEN não encontrado!');
+      console.log('Configure o ADMIN_DASH_TOKEN nas Script Properties primeiro.');
+      return { error: 'ADMIN_DASH_TOKEN não encontrado' };
+    }
+    
+    console.log('✅ ADMIN_TOKEN encontrado');
+    
+    // Obter a planilha
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    
+    // Criar cliente master
+    console.log('👤 Criando cliente master...');
+    const clienteResult = criarUsuarioDireto_(ss, {
+      email: 'cliente@elevea.com',
+      role: 'client',
+      siteSlug: 'DEMO-SITE',
+      password: 'cliente123'
+    });
+    console.log('Cliente criado:', clienteResult);
+    
+    // Criar admin master
+    console.log('👨‍💼 Criando admin master...');
+    const adminResult = criarUsuarioDireto_(ss, {
+      email: 'admin@elevea.com',
+      role: 'admin',
+      siteSlug: 'ADMIN',
+      password: 'admin123'
+    });
+    console.log('Admin criado:', adminResult);
+    
+    console.log('🎉 Contas master criadas com sucesso!');
+    console.log('📧 Cliente: cliente@elevea.com / cliente123');
+    console.log('📧 Admin: admin@elevea.com / admin123');
+    
+    return {
+      success: true,
+      message: 'Contas master criadas!',
+      cliente: clienteResult,
+      admin: adminResult
+    };
+    
+  } catch (error) {
+    console.error('❌ Erro:', error);
+    return { error: error.toString() };
+  }
+}
+
+// Função auxiliar para criar usuário diretamente na planilha
+function criarUsuarioDireto_(ss, userData) {
+  try {
+    const { email, role, siteSlug, password } = userData;
+    
+    // Garantir que a aba 'usuarios' existe
+    let sh = ss.getSheetByName('usuarios');
+    if (!sh) {
+      sh = ss.insertSheet('usuarios');
+      sh.appendRow(['email','siteSlug','role','password_hash','salt','last_login','reset_token','reset_expires','plan','billing_status','billing_next','billing_amount','billing_currency','billing_provider']);
+    }
+    
+    // Verificar se o usuário já existe
+    const data = sh.getDataRange().getValues();
+    const headers = data[0].map(h => String(h).trim());
+    const emailCol = headers.indexOf('email');
+    
+    if (emailCol !== -1) {
+      for (let i = 1; i < data.length; i++) {
+        if (String(data[i][emailCol] || '').trim().toLowerCase() === email.toLowerCase()) {
+          console.log(`Usuário ${email} já existe, atualizando...`);
+          // Atualizar usuário existente
+          const row = i + 1;
+          const salt = makeSalt_();
+          const hash = sha256Hex_(salt + password);
+          
+          sh.getRange(row, 2).setValue(siteSlug);
+          sh.getRange(row, 3).setValue(role);
+          sh.getRange(row, 4).setValue(hash);
+          sh.getRange(row, 5).setValue(salt);
+          
+          return { ok: true, email, role, siteSlug, updated: true };
+        }
+      }
+    }
+    
+    // Criar novo usuário
+    const salt = makeSalt_();
+    const hash = sha256Hex_(salt + password);
+    
+    sh.appendRow([
+      email,
+      siteSlug,
+      role,
+      hash,
+      salt,
+      '', // last_login
+      '', // reset_token
+      '', // reset_expires
+      '', // plan
+      '', // billing_status
+      '', // billing_next
+      '', // billing_amount
+      '', // billing_currency
+      ''  // billing_provider
+    ]);
+    
+    return { ok: true, email, role, siteSlug, created: true };
+    
+  } catch (error) {
+    console.error('Erro ao criar usuário:', error);
+    return { ok: false, error: error.toString() };
+  }
+}
+
+// Função para verificar se deu certo
+function verificarContas() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName('usuarios');
+    
+    if (!sh) {
+      console.log('❌ Aba usuarios não encontrada');
+      return;
+    }
+    
+    const data = sh.getDataRange().getValues();
+    console.log('📋 Usuários cadastrados:');
+    
+    data.forEach((row, index) => {
+      if (index === 0) return; // Pula cabeçalho
+      const email = row[0];
+      const siteSlug = row[1];
+      const role = row[2];
+      console.log(`${index}. ${email} (${role}) - Site: ${siteSlug}`);
+    });
+    
+  } catch (error) {
+    console.error('❌ Erro ao verificar:', error);
+  }
+}
+
+function atualizarPreapprovalNosCadastros() {
+  const ss = SpreadsheetApp.getActive();
+  const shCad   = ss.getSheetByName('cadastros');
+  const shDados = ss.getSheetByName('dados');
+  if (!shCad || !shDados) return;
+
+  // --- Guarda linhas existentes nas duas abas ---
+  const lastDados = shDados.getLastRow();   // inclui cabeçalho
+  const lastCad   = shCad.getLastRow();     // inclui cabeçalho
+
+  // Se não há dados (só cabeçalho), não faz nada
+  if (lastDados < 2 || lastCad < 2) {
+    // Opcional: Logger.log('Sem linhas suficientes: dados=%s, cadastros=%s', lastDados, lastCad);
+    return;
+  }
+
+  // Lê 'dados' com segurança (A..H; ajuste qtdColunas se quiser mais)
+  const primeiraLinhaDados = 2;
+  const qtdLinhasDados = lastDados - 1;
+  const qtdColunasDados = 8; // A..H (timestamp, event, action, mp_id, preapproval_id, status, payer_email, amount)
+  const dados = shDados
+    .getRange(primeiraLinhaDados, 1, qtdLinhasDados, qtdColunasDados)
+    .getValues();
+
+  // Mapa: email -> { ts, pre } pegando o MAIS RECENTE
+  const porEmail = {};
+  dados.forEach(r => {
+    const ts      = r[0];                // A timestamp
+    const pre     = String(r[4] || "");  // E preapproval_id
+    const email   = String(r[6] || "");  // G payer_email
+    if (!email || !pre) return;
+    const curr = porEmail[email];
+    if (!curr || ts > curr.ts) porEmail[email] = { ts, pre };
+  });
+
+  // Se não temos nenhum par email→preapproval, nada a fazer
+  if (Object.keys(porEmail).length === 0) return;
+
+  // Lê 'cadastros' (A..K) e preenche K quando vazio
+  const primeiraLinhaCad = 2;
+  const qtdLinhasCad = lastCad - 1;
+  const qtdColunasCad = 11; // A..K
+  const rangeCad = shCad
+    .getRange(primeiraLinhaCad, 1, qtdLinhasCad, qtdColunasCad)
+    .getValues();
+
+  let updates = 0;
+  rangeCad.forEach((r, i) => {
+    const email    = String(r[3] || "");   // D email
+    const preAtual = String(r[10] || "");  // K preapproval_id
+    const match    = porEmail[email];
+    if (email && !preAtual && match && match.pre) {
+      rangeCad[i][10] = match.pre; // escreve K
+      updates++;
+    }
+  });
+
+  if (updates > 0) {
+    shCad.getRange(primeiraLinhaCad, 1, qtdLinhasCad, qtdColunasCad).setValues(rangeCad);
+  }
+}
+
+
+// === STATUS API (GET) ========================================================
+// Endpoints:
+//   ?type=validate&siteSlug=SLUG&cpf=XXXXXXXXXXX  -> valida slug/CPF antes do cadastro
+//   ?type=sites                                   -> lista siteSlugs únicos da aba 'cadastros'
+//   ?type=status&site=SLUG                        -> calcula "active" pelo status mais recente
+//
+// Regras de atividade:
+//   active = true se status ∈ { authorized, approved, accredited }
+
+/* ========================= Helpers ===================================== */
+
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function safeHeaderIndex(headers, wanted, fallbackIdx) {
+  var i = headers.indexOf(wanted);
+  return (i === -1 ? fallbackIdx : i);
+}
+
+function toMillis(v) {
+  if (v instanceof Date) return v.getTime();
+  var d = new Date(v);
+  var t = d.getTime();
+  return isFinite(t) ? t : -1;
+}
