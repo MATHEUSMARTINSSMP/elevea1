@@ -1,0 +1,454 @@
+Contexto do produto (Agência Elevea):
+Temos um “cérebro” que atende várias landings de clientes (publicadas no Netlify). Cada cliente tem um mini-dashboard (dashboard do cliente) para trocar textos/cores/imagens, ver status do plano (VIP/Essencial), aprovar feedbacks e enviar mídias. Há também um dashboard admin para nós operarmos (CRUDs, gatilhos, bloqueios/reativações etc.).
+
+Hoje parte do backend está em Google Apps Script/Google Sheets/Drive + functions Netlify. Quero migrar para um backend Node.js nativo no Replit, com tudo local/gerenciável no Replit: DB nativo (SQLite inicialmente, com opção Postgres depois), App Storage para uploads, Secrets para credenciais, e Publishing do Replit para servir a API pública (porta padrão). O frontend das landings continua no Netlify, consumindo a API do Replit. Nada de GitHub/Sheets/Drive/GAS após a migração.
+
+Objetivo geral
+
+Gerar um backend Node.js/Express no Replit que substitua 100% das funções antes feitas por GAS/Sheets/Drive/Netlify Functions.
+
+Entregar APIs REST estáveis com autenticação (JWT simples) para:
+
+Sessões / login (admin e cliente)
+
+Planos (VIP/Essencial) e status de assinatura
+
+Settings por site (sections.defs + sections.data + preferences)
+
+Upload/gerência de assets (logo, fotos, “media_1..6” com aliases hero/banner, etc.)
+
+Leads e Feedbacks (público + controle de aprovação)
+
+Telemetria simples de tráfego (hits por dia)
+
+Hooks para “liga/desliga” do site (substitui build hook externo; vamos somente registrar um flag active; o site do Netlify lê este flag e esconde o conteúdo se false)
+
+Manter diferenciação VIP vs. Essencial em permissões e features.
+
+Preparar scripts de migração (opcional) e semente (seed) mínima.
+
+Preparar documentação breve dentro do repositório.
+
+Infra Replit & decisões
+
+Banco: Começar com SQLite (arquivo data/app.db) usando Prisma (ou better-sqlite3). Preparar variável de ambiente DATABASE_URL futura (Postgres), mas rodar localmente com SQLite.
+
+Uploads: Usar Replit App Storage (ou pasta local /uploads se App Storage não estiver disponível no seu plano). Precisamos de rota PUT para upload e GET público autenticado por site/token simples.
+
+Secrets (Replit):
+
+JWT_SECRET (obrigatório)
+
+ADMIN_EMAIL, ADMIN_PASSWORD (seed inicial para login admin)
+
+MAIL_FROM, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS (para e-mail transacional; se não tiver agora, criar provider console-mailer)
+
+Porta: Aplicação servindo em / (Express), com prefixo /api para endpoints.
+
+Esquema de dados (Prisma/SQL)
+
+Tabelas principais:
+
+users
+
+id (pk)
+
+role: enum('admin','client')
+
+email (unique, lower)
+
+password_hash (bcrypt)
+
+site_slug (nullable para admin)
+
+plan: enum('vip','essential') default 'essential'
+
+billing_status: string (último status do provedor; ex: approved/authorized/paused/cancelled)
+
+billing_next: datetime (próxima cobrança estimada)
+
+billing_amount: decimal
+
+billing_currency: string default 'BRL'
+
+billing_provider: string default 'mercadopago' (apenas rótulo/histórico)
+
+created_at, updated_at
+
+sites
+
+id (pk)
+
+slug (unique, uppercase logic na camada de serviço)
+
+active: boolean default true (liga/desliga)
+
+notes: text
+
+vip_pin: string (hash opcional; salvar hash do PIN; comparar com bcrypt)
+
+created_at, updated_at
+
+settings_kv (histórico de snapshots por site)
+
+id (pk)
+
+site_slug (fk)
+
+settings_json (json) // contém sections: { defs: [], data: {} }, security.vip_pin (não retornar nunca em GET)
+
+created_at
+
+assets
+
+id (pk)
+
+site_slug (fk)
+
+key (ex: 'media_1', 'hero', 'logo')
+
+url (string) // caminho público no App Storage ou /uploads/...
+
+created_at
+
+leads
+
+id (pk)
+
+site_slug
+
+name, email, phone, source
+
+created_at (timestamp)
+
+feedbacks
+
+id (pk)
+
+site_slug
+
+name, rating (1..5), comment, email, phone
+
+approved: boolean default false
+
+created_at
+
+traffic_hits
+
+id (pk)
+
+site_slug
+
+path
+
+ip, user_agent
+
+created_at (timestamp, UTC truncado ao minuto)
+
+site_hooks (opcional para futura automação externa)
+
+id (pk)
+
+site_slug (fk)
+
+notes
+
+updated_at
+
+Observações:
+
+PIN VIP: salvar hash no settings_kv OU em sites.vip_pin_hash. Vamos padronizar: sites.vip_pin_hash. E no settings_kv.settings_json, ignore qualquer security.vip_pin na gravação; nunca retornar em GET.
+
+Ativos por site: usar assets com chave + aliases na API.
+
+Regras de produto
+
+Planos
+
+VIP: pode salvar settings, trocar imagens, aprovar feedbacks, ver e-mail/telefone nos feedbacks, trocar cores e textos, etc.
+
+Essencial: leitura apenas (sem alterações); Upload bloqueado; feedbacks só públicos aprovados (sem e-mail/telefone).
+
+Status assinatura: considerar “ativo” se billing_status ∈ {approved, authorized, accredited, recurring_charges}.
+
+Caso billing_next esteja no passado + GRACE_DAYS=3, considerar cancelled e setar sites.active=false.
+
+Se voltar a ficar “ativo”, sites.active=true.
+
+Aliases de mídia:
+
+media_1 ⇄ hero/banner/principal
+
+media_2 ⇄ destaque_1/gallery_1
+
+media_3 ⇄ destaque_2/gallery_2
+
+media_4 ⇄ gallery_3
+
+media_5 ⇄ gallery_4
+
+media_6 ⇄ gallery_5
+
+Liga/Desliga: endpoint que seta sites.active, usado pelo Admin. A landing consome um endpoint público (GET /api/site-status?site=SLUG) e, se active=false, pode exibir estado “pausado”.
+
+Endpoints REST (prefixo /api)
+Auth / Sessão
+
+POST /api/auth/login
+
+body: { email, password }
+
+retorna: { ok, token, user:{role,email,siteSlug,plan} }
+
+GET /api/auth/me (header Authorization: Bearer <jwt>)
+
+retorna user
+
+Status/Plano (para o Dashboard do cliente)
+
+GET /api/subscription/status?site=SLUG&email=...
+
+retorna: { ok, siteSlug, plan, status, nextCharge, lastPayment: { date, amount } | null }
+
+VIP = plan==='vip' OU status ativo (vide regra).
+
+Settings (KV) – sections.defs + sections.data + prefs
+
+GET /api/settings?site=SLUG
+
+retorna { ok, settings } sem qualquer vip_pin
+
+POST /api/settings (auth cliente VIP OU admin)
+
+body: { site, settings, pin? }
+
+se houver pin, comparar com sites.vip_pin_hash.
+
+grava snapshot em settings_kv e atualiza cache leve em sites se aplicável.
+
+POST /api/sections/upsert-defs (só admin OU cliente com PIN ok)
+
+body: { site, defs:[{id,name,fields?,slots?}...] }
+
+preserva sections.data existente (merge).
+
+Assets
+
+GET /api/assets?site=SLUG
+
+retorna lista { key, url } já incluindo aliases duplicados
+
+PUT /api/assets (form-data) (VIP)
+
+fields: site, key, file
+
+salva em App Storage (ou /uploads) e cria/atualiza registro em assets
+
+(opcional) POST /api/assets/upload_base64 (VIP)
+
+body: { site, logo?, fotos?[] }
+
+Leads
+
+POST /api/leads (público do site)
+
+body: { site, name, email, phone, source }
+
+GET /api/leads?site=SLUG&page=1&pageSize=20 (auth cliente/admin)
+
+Feedbacks
+
+POST /api/feedbacks (público do site)
+
+body: { site, name, rating, comment, email?, phone? }
+
+cria approved=false
+
+POST /api/feedbacks/approve (VIP com PIN OU admin)
+
+body: { site, id, approved, pin? }
+
+GET /api/feedbacks?site=SLUG&page=1&pageSize=20
+
+se sem auth/PIN → retorna somente aprovados e sem email/phone
+
+se com PIN VIP → retorna todos + email/phone
+
+Tráfego
+
+POST /api/traffic/hit (público)
+
+body: { site, path } (backend registra ip, user-agent)
+
+GET /api/traffic/daily?site=SLUG&range=7d|30d|all (cliente/admin)
+
+Liga/Desliga
+
+POST /api/site/toggle (admin apenas)
+
+body: { site, active: boolean }
+
+GET /api/site-status?site=SLUG (público)
+
+{ ok, siteSlug, active }
+
+E-mail transacional (helpers)
+
+Funções utilitárias: sendWelcomeEmail, sendBillingWarn, sendBillingCancelled
+
+Usar SMTP se secrets disponíveis; senão, logar no console.
+
+Regras de segurança
+
+Todas as rotas de mutação exigem JWT (cliente do próprio site) ou admin.
+
+Ações de VIP exigem: o usuário ter plan='vip' OU status ativo, e (quando pedido) PIN correto do site (comparar com hash).
+
+Nunca retornar vip_pin em GET.
+
+Sanitizar inputs: site sempre normalize (trim().toUpperCase()).
+
+UX/Fluxos importantes do Dashboard (cliente)
+
+“Descobrir VIP”: dashboard chama GET /api/subscription/status?.... Exibir VIP ativo se status ativo ou plan='vip'.
+
+Retry: botão “Tentar novamente” refaz a consulta.
+
+Feedbacks: quando digitar PIN válido no topo, chamar novamente GET /api/feedbacks com header Authorization e/ou mandar o pin; backend retorna dados completos; habilitar botões Publicar/Ocultar.
+
+Upload: PUT /api/assets atualiza imagem do slot e retorna url.
+
+Cores/Textos: POST /api/settings com pin se VIP (ou admin).
+
+Tarefas para você (raplit)
+
+Criar projeto Node.js/Express com:
+
+Estrutura:
+
+/src
+  /routes
+    auth.ts
+    subscription.ts
+    settings.ts
+    sections.ts
+    assets.ts
+    leads.ts
+    feedbacks.ts
+    traffic.ts
+    site.ts
+  /services
+  /db
+  /middlewares
+  /utils
+/uploads  (se App Storage indisponível)
+prisma/schema.prisma (ou migrations SQL)
+
+
+Middleware CORS básico, JSON, form-data (multer).
+
+Auth JWT (roles).
+
+Modelar DB com Prisma (ou SQL direto) conforme esquema acima. Gerar migrations. Criar seed:
+
+Admin padrão (ADMIN_EMAIL, ADMIN_PASSWORD).
+
+1 site de exemplo SITE-EXEMPLO ativo e um usuário cliente vinculado.
+
+Implementar todas as rotas descritas, incluindo validações, aliases de mídia e regras de visibilidade para feedbacks.
+
+Implementar política de cobrança local (sem provedor real neste momento):
+
+Função diária (cron da app: setInterval + reinício em deploy) que:
+
+se billing_next < hoje - GRACE_DAYS → billing_status='cancelled' e sites.active=false.
+
+se billing_status voltar ativo (simular via admin) → sites.active=true.
+
+Expor rota admin POST /api/admin/users/:id/billing para ajustar status manualmente neste MVP.
+
+Uploads:
+
+Suportar PUT /api/assets (form-data). Salvar arquivo em App Storage ou /uploads. Retornar URL pública (Ex.: /uploads/<site>/<filename>).
+
+Em GET /api/assets, mapear aliases.
+
+Ocultar PIN no GET de settings. Ao salvar com pin correto, manter sites.vip_pin_hash (bcrypt). Se o site ainda não tem PIN, permitir setar via admin.
+
+Documentação:
+
+Criar README.md com:
+
+Como rodar localmente no Replit
+
+Variáveis de ambiente
+
+Lista de endpoints
+
+Fluxos do dashboard do cliente (VIP gate)
+
+Como o Netlify (landing) consome: GET /api/site-status, GET /api/assets, GET /api/settings, POST /api/traffic/hit, POST /api/feedbacks.
+
+Testes manuais (critérios de aceite):
+
+Login admin e cliente OK.
+
+GET /api/subscription/status retorna informações e determina VIP corretamente.
+
+Upload de media_1..6 com render via URL.
+
+GET /api/assets lista com aliases.
+
+POST /api/settings com pin e sem pin (erro) conforme plano.
+
+GET /api/feedbacks público vs. VIP com PIN (diferença de campos e pendências).
+
+POST /api/feedbacks/approve funciona com PIN ou admin.
+
+POST /api/traffic/hit grava e GET /api/traffic/daily agrega.
+
+POST /api/site/toggle admin altera active, e GET /api/site-status reflete.
+
+Pontos que normalmente dão erro (evitar)
+
+Case do siteSlug: padronize UPPERCASE no backend.
+
+PIN em settings_kv: nunca salvar/retornar security.vip_pin no JSON. Use sites.vip_pin_hash.
+
+CORS/headers: liberar Authorization e Content-Type, credenciais desnecessárias.
+
+Uploads: garantir criação de subpastas por site.
+
+Status VIP: confira tanto plan quanto billing_status (lista de “ativos”).
+
+Paginação: não esqueça page/pageSize nos leads/feedbacks.
+
+JWT: expiração e verificação de role para rotas sensíveis.
+
+Integração com as landings no Netlify
+
+As landings continuarão no Netlify (sem functions). Elas consomem somente o backend do Replit:
+
+Render: GET /api/site-status?site=SLUG (se active=false, exibir tela “pausado”).
+
+Conteúdo: GET /api/settings?site=SLUG, GET /api/assets?site=SLUG.
+
+Telemetria: em cada visita, POST /api/traffic/hit com {site, path}.
+
+Form: POST /api/leads e POST /api/feedbacks.
+
+Entregáveis
+
+Replit workspace com:
+
+Código fonte em /src
+
+DB/migrations (Prisma)
+
+Uploads servidos publicamente
+
+README.md com instruções e endpoints
+
+Tudo rodando em uma única aplicação (porta padrão do Replit).
+
+Comece criando a estrutura, modelos Prisma e as rotas básicas (auth, subscription, settings, assets). Depois, adicione leads, feedbacks, traffic, site toggle. No final, rode um teste completo e descreva no README como usar.
