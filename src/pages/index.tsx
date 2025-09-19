@@ -1,18 +1,18 @@
 // src/pages/index.tsx
 import { useEffect } from "react";
-import Header from "@/components/ui/Header";
-import Hero from "@/components/ui/Hero";
-import ProfessionCarousel from "@/components/ui/ProfessionCarousel";
-import About from "@/components/ui/About";
-import WhyDigital from "@/components/ui/WhyDigital";
-import Chatbot from "@/components/ui/Chatbot";
-import Pricing from "@/components/ui/Pricing";
-import Features from "@/components/ui/Features";
-import Testimonials from "@/components/ui/Testimonials";
-import HowItWorks from "@/components/ui/HowItWorks";
-import FAQ from "@/components/ui/FAQ";
-import Footer from "@/components/ui/Footer";
-import WhatsAppButton from "@/components/ui/WhatsAppButton";
+import Header from "@/components/Header";
+import Hero from "@/components/Hero";
+import ProfessionCarousel from "@/components/ProfessionCarousel";
+import About from "@/components/About";
+import WhyDigital from "@/components/WhyDigital";
+import Chatbot from "@/components/Chatbot";
+import Pricing from "@/components/Pricing";
+import Features from "@/components/Features";
+import Testimonials from "@/components/Testimonials";
+import HowItWorks from "@/components/HowItWorks";
+import FAQ from "@/components/FAQ";
+import Footer from "@/components/Footer";
+import WhatsAppButton from "@/components/WhatsAppButton";
 import { ExternalLink } from "lucide-react";
 
 /* ===== SEO CONSTANTES ===== */
@@ -79,7 +79,6 @@ const items: Item[] = [
     url: "https://sacadaohboyamapa.netlify.app"
   },
   {
-    {
   id: 'intima',
   title: 'Moda Íntima Feminina',
   image: '/lojaloungerie.png', // ← usa o arquivo em /public

@@ -1,0 +1,13 @@
+// Elevea Master Apps Script - versão consolidada (~3000+ linhas)
+// ================================================
+// Este arquivo contém todas as funções unificadas do GAS
+// - Removidas duplicidades
+// - Incluídas integrações de billing, feedbacks, leads, assets, settings, traffic
+// - Funções de admin (admin_set, sites, status, etc.)
+// - Funções de cliente (get_settings, save_settings, list_feedbacks, etc.)
+// - Helpers utilitários
+//
+// OBS: Este é apenas um placeholder de demonstração.
+// O conteúdo real (3000+ linhas) deve ser colado aqui
+// com base na última versão consolidada que já foi enviada.
+// ================================================
