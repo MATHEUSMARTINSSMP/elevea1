@@ -4,7 +4,7 @@ export const API_BASE_URL =
   import.meta.env.VITE_BACKEND_URL ||
   (typeof window !== 'undefined' && window.location.origin.includes('localhost') 
     ? 'http://localhost:5000' 
-    : 'https://seu-repl.replit.app'); // Substitua pela URL real do seu Replit
+    : window.location.origin); // Usa o próprio domínio em produção
 
 export const APPS_ENDPOINT = API_BASE_URL; // Compatibilidade
 
