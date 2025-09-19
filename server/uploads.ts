@@ -77,7 +77,7 @@ export function createUploadHandler(dbStorage: IStorage) {
           return res.status(400).json({ ok: false, error: 'nenhum_arquivo_enviado' });
         }
 
-        const savedAssets = [];
+        const savedAssets: any[] = [];
 
         // Salvar cada arquivo no banco
         for (const file of files) {
@@ -175,7 +175,7 @@ export function createBase64UploadHandler(dbStorage: IStorage) {
         return res.status(400).json({ ok: false, error: 'dados_de_arquivo_invalidos' });
       }
 
-      const savedAssets = [];
+      const savedAssets: any[] = [];
 
       for (const fileData of files) {
         const { filename, content, mimetype } = fileData;

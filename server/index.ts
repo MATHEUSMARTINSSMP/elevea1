@@ -5,10 +5,9 @@ import path from 'path';
 import { promises as fs } from 'fs';
 import { initDatabase, SqliteStorage, IStorage } from './database';
 import { createApiRoutes } from './routes';
-import { createUploadHandler } from './uploads';
 
 // Configurações
-const PORT = process.env.PORT || 5000;
+const PORT = parseInt(process.env.PORT || '5000', 10);
 const isDev = process.env.NODE_ENV !== 'production';
 
 async function startServer() {

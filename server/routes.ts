@@ -57,7 +57,7 @@ export function createApiRoutes(storage: IStorage): Router {
   });
 
   // GET /api/settings?site=SLUG - Obter configurações do site
-  router.get('/settings', validateSiteSlug, async (req, res) => {
+  router.get('/settings', validateSiteSlug, async (req: any, res: any) => {
     try {
       const site = await storage.getSite(req.siteSlug);
       if (!site) {
@@ -97,7 +97,7 @@ export function createApiRoutes(storage: IStorage): Router {
   // === LEADS ===
 
   // GET /api/leads?site=SLUG&page=1&pageSize=20
-  router.get('/leads', validateSiteSlug, async (req, res) => {
+  router.get('/leads', validateSiteSlug, async (req: any, res: any) => {
     try {
       const page = parseInt(String(req.query.page || '1'), 10);
       const pageSize = parseInt(String(req.query.pageSize || '20'), 10);
@@ -133,7 +133,7 @@ export function createApiRoutes(storage: IStorage): Router {
   // === FEEDBACKS ===
 
   // GET /api/feedbacks?site=SLUG&page=1&pageSize=20&public=0
-  router.get('/feedbacks', validateSiteSlug, async (req, res) => {
+  router.get('/feedbacks', validateSiteSlug, async (req: any, res: any) => {
     try {
       const page = parseInt(String(req.query.page || '1'), 10);
       const pageSize = parseInt(String(req.query.pageSize || '20'), 10);
@@ -213,7 +213,7 @@ export function createApiRoutes(storage: IStorage): Router {
   });
 
   // GET /api/traffic?site=SLUG&range=30d - Estatísticas de tráfego
-  router.get('/traffic', validateSiteSlug, async (req, res) => {
+  router.get('/traffic', validateSiteSlug, async (req: any, res: any) => {
     try {
       const range = String(req.query.range || '30d');
       let days = 30;
@@ -233,7 +233,7 @@ export function createApiRoutes(storage: IStorage): Router {
   // === ASSETS ===
 
   // GET /api/assets?site=SLUG - Listar assets
-  router.get('/assets', validateSiteSlug, async (req, res) => {
+  router.get('/assets', validateSiteSlug, async (req: any, res: any) => {
     try {
       const assets = await storage.listAssets(req.siteSlug);
       res.json({ ok: true, assets });
@@ -315,7 +315,7 @@ export function createApiRoutes(storage: IStorage): Router {
   });
 
   // GET /api/status?site=SLUG - Status do site
-  router.get('/status', validateSiteSlug, async (req, res) => {
+  router.get('/status', validateSiteSlug, async (req: any, res: any) => {
     try {
       const site = await storage.getSite(req.siteSlug);
       if (!site) {
