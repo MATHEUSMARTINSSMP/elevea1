@@ -15,7 +15,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Configurações
-const PORT = parseInt(process.env.PORT || '5000', 10);
+const PORT = parseInt(process.env.PORT || '8080', 10);
 const isDev = process.env.NODE_ENV !== 'production';
 
 console.log('🚀 Iniciando servidor Elevea nativo...');
@@ -555,7 +555,11 @@ async function startServer() {
     try {
       const { createServer: createViteServer } = await import('vite');
       const vite = await createViteServer({
-        server: { middlewareMode: true },
+        server: { 
+          middlewareMode: true,
+          host: '0.0.0.0',
+          allowedHosts: 'all'
+        },
         appType: 'spa',
       });
 
