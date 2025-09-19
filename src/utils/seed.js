@@ -8,7 +8,7 @@ export async function seedDatabase() {
   
   try {
     // Check if already seeded
-    const adminCheck = db.prepare('SELECT COUNT(*) as count FROM users WHERE role = "admin"').get();
+    const adminCheck = db.prepare('SELECT COUNT(*) as count FROM users WHERE role = ?').get('admin');
     if (adminCheck.count > 0) {
       console.log('✅ Database already seeded, skipping');
       return;
