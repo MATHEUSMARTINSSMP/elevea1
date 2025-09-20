@@ -16,8 +16,8 @@ import { promises as fs } from 'fs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Configuration
-const PORT = parseInt(process.env.PORT || '8080', 10);
+// Configuration - Use port 5000 to match workflow expectation
+const PORT = parseInt(process.env.PORT || '5000', 10);
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const isDev = NODE_ENV !== 'production';
 

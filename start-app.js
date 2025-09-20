@@ -13,6 +13,7 @@
  * - Automatic database seeding
  */
 
+// Set port for ELEVEA server to match workflow expectation
 process.env.PORT = '5000';
 process.env.NODE_ENV = process.env.NODE_ENV || 'development';
 
@@ -23,8 +24,8 @@ console.log('💎 Plans: Essential & VIP with PIN validation');
 console.log('💾 Database: SQLite with automatic seeding');
 console.log('');
 
-// Start the ELEVEA backend server
-import('./src/server.js').catch((error) => {
+// Start the ELEVEA backend server with Vite integration
+import('./server.mjs').catch((error) => {
   console.error('❌ Failed to start ELEVEA server:', error);
   process.exit(1);
 });
